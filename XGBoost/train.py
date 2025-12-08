@@ -5,10 +5,23 @@ from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_squared_error
 import logging
 import datetime
+import joblib
+from pathlib import Path
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Параметры модели (единое место для CV и финальной модели)
+MODEL_PARAMS = {
+    'objective': 'reg:squarederror',
+    'n_estimators': 500,  # увеличено для early stopping
+    'learning_rate': 0.1,
+    'max_depth': 5,
+    'random_state': 42,
+    'n_jobs': -1,
+    'early_stopping_rounds': 50
+}
 
 def generate_mock_data(n_samples=1000):
     """
@@ -49,21 +62,11 @@ def generate_mock_data(n_samples=1000):
     # Генерируем размер окна
     df['hist_window_size'] = np.random.randint(0, 13, n_samples) # 0..12
     
-    # Инициализируем колонки
-    hist_cols = [
-        'hist_median_views', 'hist_mean_views', 'hist_std_views', 
-        'hist_trend_views', 'hist_median_likes', 'hist_avg_er', 
-        'hist_days_since_last', 'hist_post_freq'
-    ]
-    
-    for col in hist_cols:
-        df[col] = np.random.normal(0, 1, n_samples) # Заглушка, перезапишем ниже
-        
-    # Симуляция значений
+    # Симуляция исторических значений
     df['hist_median_views'] = np.log1p(np.random.exponential(3000, n_samples))
     df['hist_mean_views'] = df['hist_median_views'] * np.random.uniform(0.8, 1.2, n_samples)
-    df['hist_std_views'] = df['hist_mean_views'] * 0.5
-    df['hist_trend_views'] = np.random.normal(1.0, 0.5, n_samples)
+    df['hist_std_views'] = df['hist_mean_views'] * np.random.uniform(0.3, 0.7, n_samples)  # вариация
+    df['hist_trend_views'] = np.clip(np.random.normal(1.0, 0.3, n_samples), 0.1, 3.0)  # clip > 0
     df['hist_median_likes'] = df['hist_median_views'] * 0.1
     df['hist_avg_er'] = np.random.uniform(0.01, 0.20, n_samples)
     df['hist_days_since_last'] = np.random.exponential(5, n_samples)
@@ -73,10 +76,10 @@ def generate_mock_data(n_samples=1000):
     # Как указано в Tech Specs: "если hist_window_size < 3... Разработчик 1 может оставлять NaN"
     mask_new_account = df['hist_window_size'] < 3
     
-    # Обнуляем исторические метрики для таких случаев
+    # Ставим NaN для исторических метрик новых аккаунтов
     cols_to_nan = [
-        'hist_median_views', 'hist_mean_views', 'hist_std_views', 
-        'hist_trend_views', 'hist_median_likes', 'hist_avg_er', 
+        'hist_median_views', 'hist_mean_views', 'hist_std_views',
+        'hist_trend_views', 'hist_median_likes', 'hist_avg_er',
         'hist_days_since_last', 'hist_post_freq'
     ]
     
@@ -96,22 +99,45 @@ def preprocess_data(df, fill_values=None):
     df_clean = df.copy()
     
     if fill_values is None:
-        # 1. Views -> Глобальная медиана по текущей выборке
+        # 1. Views -> Глобальная медиана по текущей выборке, fallback = 300 (контракт)
         global_median_views = df['hist_median_views'].median()
         if np.isnan(global_median_views):
-             global_median_views = 0 # Fallback
+            global_median_views = 300.0
+            logger.warning("Imputation: hist_median_views медиана NaN, используем дефолт 300.0")
         
-        logger.info(f"Imputation: Computed Global Median Views = {global_median_views:.4f}")
+        # 2. Вычисляем медианы для остальных полей (fallback = пропорции из mock data)
+        global_median_std = df['hist_std_views'].median()
+        if np.isnan(global_median_std):
+            global_median_std = global_median_views * 0.5
+        
+        global_median_likes = df['hist_median_likes'].median()
+        if np.isnan(global_median_likes):
+            global_median_likes = global_median_views * 0.1
+        
+        global_median_er = df['hist_avg_er'].median()
+        if np.isnan(global_median_er):
+            global_median_er = 0.05
+        
+        global_median_freq = df['hist_post_freq'].median()
+        if np.isnan(global_median_freq):
+            global_median_freq = 0.5
+        
+        global_median_days = df['hist_days_since_last'].median()
+        if np.isnan(global_median_days):
+            global_median_days = 7.0  # fallback: неделя
+        
+        logger.info(f"Imputation: views={global_median_views:.2f}, std={global_median_std:.2f}, "
+                    f"likes={global_median_likes:.2f}, er={global_median_er:.3f}, days={global_median_days:.1f}")
         
         fill_values = {
             'hist_median_views': global_median_views,
             'hist_mean_views': global_median_views,
-            'hist_std_views': 0,
-            'hist_median_likes': 0,
-            'hist_avg_er': 0,
-            'hist_post_freq': 0,
+            'hist_std_views': global_median_std,
+            'hist_median_likes': global_median_likes,
+            'hist_avg_er': global_median_er,
+            'hist_post_freq': global_median_freq,
             'hist_trend_views': 1.0,
-            'hist_days_since_last': -1
+            'hist_days_since_last': global_median_days
         }
         return_stats = True
     else:
@@ -126,14 +152,17 @@ def preprocess_data(df, fill_values=None):
         return df_clean, fill_values
     return df_clean
 
-def train_model(df):
+def train_model(df, save_path=None):
     """
     Обучает XGBoost с GroupKFold валидацией.
     Внутри цикла CV делает imputation, чтобы избежать Data Leakage.
+    
+    Returns:
+        tuple: (final_model, fill_stats, feature_cols)
     """
     logger.info("Настройка обучения модели...")
     
-    # Выбор фичей: все st_ и hist_
+    # Выбор фичей: все st_ и все hist_ включая hist_window_size (важно для cold start)
     feature_cols = [c for c in df.columns if c.startswith('st_') or c.startswith('hist_')]
     target_col = 'target_views_log'
     group_col = 'account_id'
@@ -144,17 +173,6 @@ def train_model(df):
     
     logger.info(f"Фичи ({len(feature_cols)}): {feature_cols}")
     
-    # Инициализация модели
-    # Используем базовые параметры, можно тюнить позже
-    model = xgb.XGBRegressor(
-        objective='reg:squarederror',
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=5,
-        random_state=42,
-        n_jobs=-1
-    )
-    
     # GroupKFold Split
     n_splits = 5
     gkf = GroupKFold(n_splits=n_splits)
@@ -163,8 +181,7 @@ def train_model(df):
     
     logger.info(f"Запуск Cross-Validation ({n_splits} folds)...")
     
-    fold = 1
-    for train_idx, val_idx in gkf.split(X, y, groups):
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups), 1):
         # Разбиваем на трейн и валидацию (пока с NaN)
         X_train_raw, X_val_raw = X.iloc[train_idx], X.iloc[val_idx]
         y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
@@ -175,8 +192,13 @@ def train_model(df):
         # 2. Imputation на Val (применяем статистики с трейна)
         X_val_clean = preprocess_data(X_val_raw, fill_values=fill_stats)
         
-        # Обучение
-        model.fit(X_train_clean, y_train)
+        # Обучение с early stopping
+        model = xgb.XGBRegressor(**MODEL_PARAMS)
+        model.fit(
+            X_train_clean, y_train,
+            eval_set=[(X_val_clean, y_val)],
+            verbose=False
+        )
         
         # Предсказание
         preds = model.predict(X_val_clean)
@@ -185,26 +207,56 @@ def train_model(df):
         rmse = np.sqrt(mean_squared_error(y_val, preds))
         rmse_scores.append(rmse)
         
-        logger.info(f"Fold {fold}: RMSE = {rmse:.4f} (Train size: {len(X_train_clean)}, Val size: {len(X_val_clean)})")
-        fold += 1
+        logger.info(f"Fold {fold}: RMSE = {rmse:.4f} "
+                    f"(Train: {len(X_train_clean)}, Val: {len(X_val_clean)}, "
+                    f"Trees: {model.best_iteration + 1})")
         
     avg_rmse = np.mean(rmse_scores)
-    std_rmse = np.std(rmse_scores)
+    std_rmse = np.std(rmse_scores, ddof=1)  # sample std
     
     logger.info(f"CV Results: Mean RMSE = {avg_rmse:.4f} +/- {std_rmse:.4f}")
     
-    return model
+    # Финальная модель: обучаем на всем датасете
+    X_full_clean, full_fill_stats = preprocess_data(X)
+    
+    # Для финальной модели используем среднее кол-во деревьев из CV (без early stopping)
+    final_params = MODEL_PARAMS.copy()
+    final_params.pop('early_stopping_rounds', None)
+    final_params['n_estimators'] = 100  # фиксированное для финала
+    
+    final_model = xgb.XGBRegressor(**final_params)
+    final_model.fit(X_full_clean, y)
+    
+    # Feature Importance
+    importance = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': final_model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    logger.info(f"Top-5 Features:\n{importance.head().to_string(index=False)}")
+    
+    # Сохранение модели и статистик
+    if save_path:
+        save_path = Path(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        joblib.dump(final_model, save_path / 'model.joblib')
+        joblib.dump(full_fill_stats, save_path / 'fill_stats.joblib')
+        joblib.dump(feature_cols, save_path / 'feature_cols.joblib')
+        logger.info(f"Model saved to {save_path}")
+    
+    return final_model, full_fill_stats, feature_cols
 
 if __name__ == "__main__":
     try:
         # 1. Генерация
         mock_df = generate_mock_data(n_samples=2000)
         
-        # 2. Препроцессинг больше не вызывается здесь глобально, чтобы избежать Data Leakage.
-        # Imputation перенесен внутрь train_model (в цикл CV).
-            
-        # 3. Обучение
-        final_model = train_model(mock_df)
+        # 2. Обучение (imputation внутри CV для предотвращения data leakage)
+        final_model, fill_stats, feature_cols = train_model(
+            mock_df, 
+            save_path='XGBoost/artifacts'
+        )
         
         logger.info("Прототип обучения завершен успешно.")
         
