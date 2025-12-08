@@ -1,0 +1,63 @@
+---
+alwaysApply: true
+---
+### DATA CONTRACT (Схема DataFrame)
+
+**Разработчик 1** обязан выдать таблицу именно с этими названиями колонок.
+
+**Разработчик 2** пишет код обучения, ожидая именно эти колонки.
+
+### 1. Идентификаторы (Meta)
+
+*Эти поля нужны для связки, но НЕ идут в обучение XGBoost*
+
+- account_id (str)
+- video_id (str) — *или имя файла*
+- upload_date (datetime)
+- video_text (str) — *для финала, чтобы потом не искать*
+
+### 2. Таргет (Target)
+
+- target_views_log (float) -> np.log1p(current_video_views)
+
+### 3. Статика (Static Features)
+
+- st_log_followers (float)
+- st_ratio_ff (float)
+- st_is_verified (int: 0/1)
+- st_is_business (int: 0/1)
+- st_bio_length (int)
+- st_hist_total_posts (int) -> *calculated at upload time*
+
+### 4. Исторические (History / Rolling Window)
+
+- hist_window_size (int) -> *сколько видео реально нашлось (0..12)*
+- hist_median_views (float)
+- hist_mean_views (float)
+- hist_std_views (float)
+- hist_trend_views (float) -> *Median(last 3) / Median(last 12)*
+- hist_median_likes (float)
+- hist_avg_er (float) -> *Mean of (likes/views)*
+- hist_days_since_last (float)
+- hist_post_freq (float)
+
+---
+
+### ⚡ Важные замечания для реализации (Tech Specs)
+
+### Для Разработчика 1 (Data Engineer):
+
+1. **Trend Logic:** Тебе нужно внутри окна (12 элементов) брать под-окно (последние 3 элемента).
+    - *Формула:* trend = rolling_slice[-3:].median() / (rolling_slice.median() + 1e-5) (добавь эпсилон от деления на ноль).
+2. **ER Logic:** Лайки+коменты/просмотры
+3. **Time Travel:** st_hist_total_posts = profile['posts_count'] минус количество видео, у которых timestamp > current_video_timestamp.
+
+### Для Разработчика 2 (Data Scientist):
+
+1. **Handling NaNs (Imputation):**
+    - Договоритесь: если hist_window_size < 3 (новый аккаунт), Разработчик 1 может оставлять NaN в полях медиан.
+    - Ты в своем пайплайне делаешь fillna():
+        - Для views: глобальная медиана по датасету (обычно ~300-500).
+        - Для trend: 1.0 (нет тренда).
+        - Для days_since_last: -1 или большое число (например, 30).
+2. **Target Leak:** Убедись, что target_views_log берется из **текущего** видео, а все hist_ фичи — строго из **предыдущих**.
