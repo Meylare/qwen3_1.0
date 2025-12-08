@@ -11,3 +11,4 @@ venv/
 
 *jsonl
 *.parquet
+*.csv
