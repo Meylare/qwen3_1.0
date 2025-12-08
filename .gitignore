@@ -9,3 +9,6 @@ venv/
 *.swp
 .DS_Store
 
+*jsonl
+*.parquet
+*.csv
