@@ -12,3 +12,5 @@ venv/
 *jsonl
 *.parquet
 *.csv
+*.json
+*.joblib
