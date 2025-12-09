@@ -10,7 +10,7 @@ from pathlib import Path
 # ... (все конфиги и функция preprocess_data без изменений) ...
 # --- КОНФИГУРАЦІЯ ---
 INPUT_FILE = "dataset_v0_complete.parquet"
-MODEL_SAVE_DIR = "XGBoost/artifacts_real"
+MODEL_SAVE_DIR = "XGBoost/artifacts_real_clean_data"
 TARGET_COL = 'target_views_log'
 GROUP_COL = 'account_id'
 

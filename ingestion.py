@@ -10,6 +10,9 @@ PROFILES_PATH = "owners.jsonl"
 VIDEOS_PATH = "100k.jsonl"
 OUTPUT_FILE = "dataset_v1_raw.parquet"
 
+# Минимальный порог просмотров (удаляем мусор)
+MIN_VIEWS_THRESHOLD = 5
+
 def load_jsonl_robust(file_path):
     """
     Безопасная загрузка JSONL.
@@ -29,7 +32,7 @@ def load_jsonl_robust(file_path):
     return pd.DataFrame(data)
 
 def run_etl():
-    print("🚀 Начинаем ETL процесс (ФИНАЛЬНАЯ ВЕРСИЯ)...")
+    print("🚀 Начинаем ETL процесс (Filter views < 5)...")
 
     # 1. ЗАГРУЗКА
     df_profiles = load_jsonl_robust(PROFILES_PATH)
@@ -51,15 +54,21 @@ def run_etl():
     df_videos['upload_date'] = pd.to_datetime(df_videos['upload_date'], errors='coerce')
     df_videos = df_videos.dropna(subset=['upload_date', 'video_id'])
 
-    # --- 🔥 САНИТАЙЗЕР ОТРИЦАТЕЛЬНЫХ ЗНАЧЕНИЙ 🔥 ---
+    # --- САНИТАЙЗЕР ---
     print("🧹 Санитарная обработка: убираем отрицательные значения...")
     cols_to_sanitize = ['views', 'likes', 'comments']
     for col in cols_to_sanitize:
         if col in df_videos.columns:
-            # clip(lower=0) заменяет все отрицательные числа на 0
             df_videos[col] = df_videos[col].clip(lower=0)
 
-    # 3. MERGE И ФИНАЛИЗАЦИЯ
+    # --- 🔥 НОВЫЙ ФИЛЬТР: УДАЛЯЕМ МУСОРНЫЕ ПРОСМОТРЫ 🔥 ---
+    print(f"✂️ Фильтрация: удаляем видео, где views < {MIN_VIEWS_THRESHOLD}...")
+    initial_count = len(df_videos)
+    df_videos = df_videos[df_videos['views'] >= MIN_VIEWS_THRESHOLD]
+    dropped = initial_count - len(df_videos)
+    print(f"   Удалено {dropped} видео с почти нулевыми просмотрами.")
+
+    # 3. MERGE
     print("🔗 Объединяем...")
     full_df = df_videos.merge(df_profiles, left_on='account_id_join', right_on='account_id', how='inner')
     full_df = full_df.sort_values(by=['account_id', 'upload_date'], ascending=[True, True])
@@ -69,7 +78,6 @@ def run_etl():
     cols_to_save = [c for c in final_columns if c in full_df.columns]
     full_df = full_df[cols_to_save]
     
-    # Приведение типов
     if 'st_is_verified' in full_df.columns: full_df['st_is_verified'] = full_df['st_is_verified'].fillna(False).astype(int)
     if 'st_is_business' in full_df.columns: full_df['st_is_business'] = full_df['st_is_business'].fillna(False).astype(int)
     full_df['video_id'] = full_df['video_id'].astype(str)
@@ -79,7 +87,7 @@ def run_etl():
     print(f"💾 Сохраняем в {OUTPUT_FILE}...")
     full_df.to_parquet(OUTPUT_FILE, index=False)
     
-    print(f"\n✅ ETL ЗАВЕРШЕН! (ФИНАЛЬНАЯ ВЕРСИЯ)")
+    print(f"\n✅ ETL ЗАВЕРШЕН! (Чистые данные)")
 
 if __name__ == "__main__":
     run_etl()

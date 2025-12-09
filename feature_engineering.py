@@ -1,146 +1,156 @@
 import pandas as pd
 import numpy as np
-import json
 from tqdm import tqdm
 
 # --- КОНФИГУРАЦИЯ ---
 INPUT_FILE = "dataset_v1_raw.parquet"
 OUTPUT_PARQUET = "full_history_features.parquet"
 
-# ВАЖНО: Ставим 1, чтобы включить "Накопительную медиану"
-# Теперь мы не ждем 3 видео, а используем то, что есть.
-MIN_WINDOW = 1 
-MAX_WINDOW = 12
-TREND_EPS = 1e-5
+WINDOW_LONG = 15
+WINDOW_SHORT = 4
 
-# Значения для импутации (Только для самого ПЕРВОГО видео, где истории нет вообще)
+# ЗАГЛУШКИ
 DEFAULT_VIEWS = 300.0
-DEFAULT_TREND = 1.0
+DEFAULT_LIKES = 0.0
 DEFAULT_ER = 0.0
-DEFAULT_DAYS = -1.0 # Маркер отсутствия предыдущего видео
+DEFAULT_DAYS = -1.0
+DEFAULT_FREQ = 0.0
+DEFAULT_TREND = 1.0
 
-def run_sliding_window_task():
-    print("🚀 Запуск задачи: Sliding Window & Time Travel (Task 3 & 4)...")
+def run_feature_engineering_v5():
+    print("🚀 Запуск Feature Engineering (V5.1: Fix Timedelta error)...")
 
     # 1. Загрузка
     print(f"📥 Читаем {INPUT_FILE}...")
     df = pd.read_parquet(INPUT_FILE)
-    
-    # КРИТИЧНО: Сортировка для правильной работы shift()
     df = df.sort_values(by=['account_id', 'upload_date'], ascending=[True, True])
 
-    # ==========================================
-    # ⏳ ЧАСТЬ 1: TIME TRAVEL LOGIC (Posts Count)
-    # ==========================================
-    print("⏳ Выполнение Time Travel (корректировка счетчика постов)...")
-    
-    # Считаем, сколько видео у автора ВПЕРЕДИ (относительно текущей строки)
-    # cumcount дает 0, 1, 2...
-    # transform('count') дает общее число
-    # future_videos = total - 1 - current_rank
-    
+    # 2. Time Travel
+    print("⏳ Time Travel...")
     video_counts = df.groupby('account_id')['video_id'].transform('count')
+    df['total_videos_count'] = video_counts 
+    
     video_rank = df.groupby('account_id').cumcount()
     videos_after = video_counts - 1 - video_rank
-    
-    # Вычитаем будущие видео из текущего счетчика в профиле
     df['st_hist_total_posts'] = (df['profile_current_posts'] - videos_after).clip(lower=0)
 
     # ==========================================
-    # 🪟 ЧАСТЬ 2: SLIDING WINDOW ENGINE
+    # 🪟 SLIDING WINDOW
     # ==========================================
-    print("🪟 Расчет скользящего окна (Cumulative Logic)...")
+    print("🪟 Расчет истории...")
     grouped = df.groupby('account_id')
-    
-    # 1. Создаем ЛАГИ (сдвиг назад на 1 шаг)
-    # Мы не имеем права видеть текущие просмотры при расчете истории!
+
     lag_views = grouped['views'].shift(1)
     lag_likes = grouped['likes'].shift(1)
     lag_comments = grouped['comments'].shift(1)
     lag_date = grouped['upload_date'].shift(1)
-    
-    # 2. Дней с прошлого видео
-    # (Текущая дата - Дата предыдущего видео)
+
+    # --- Days Since Last ---
+    # Тут все ок, мы сразу конвертируем в секунды
     df['hist_days_since_last'] = (df['upload_date'] - lag_date).dt.total_seconds() / 86400
-    
-    # 3. Основные Агрегаты (Views)
-    # min_periods=1 включает накопительную логику
-    roller_12 = lag_views.rolling(window=MAX_WINDOW, min_periods=MIN_WINDOW)
-    
-    df['hist_median_views'] = roller_12.median()
-    df['hist_mean_views'] = roller_12.mean()
-    df['hist_std_views'] = roller_12.std() # Будет NaN, если в истории 1 элемент (это норм)
-    
-    # 4. Тренд (Короткое окно / Длинное окно)
-    # min_periods=1 позволяет считать тренд уже на 2-м видео (будет 1.0)
-    roller_3 = lag_views.rolling(window=3, min_periods=MIN_WINDOW)
-    # Добавляем эпсилон, чтобы не делить на ноль и сохранить масштаб сырого отношения
-    df['hist_trend_views'] = roller_3.median() / (df['hist_median_views'] + TREND_EPS)
 
-    # 5. ER и Лайки
-    df['hist_median_likes'] = lag_likes.rolling(window=MAX_WINDOW, min_periods=MIN_WINDOW).median()
+    # --- Post Frequency (FIX HERE) ---
+    # 1. Считаем разницу дат
+    date_diffs = grouped['upload_date'].diff()
     
-    # ER считаем построчно, потом усредняем
-    # +1 защита от деления на ноль
-    prev_er_series = (lag_likes + lag_comments) / (lag_views + 1)
-    df['hist_avg_er'] = prev_er_series.rolling(window=MAX_WINDOW, min_periods=MIN_WINDOW).mean()
+    # 2. 🔥 ПРЕВРАЩАЕМ В ЧИСЛО (ДНИ) СРАЗУ 🔥
+    # Pandas не умеет делать rolling().mean() над типом Timedelta
+    date_diffs_days = date_diffs.dt.total_seconds() / 86400
     
-    # 6. Размер окна (Честный счетчик)
-    # Показывает, сколько реально видео взято в расчет (0, 1, 2 ... 12)
-    df['hist_window_size'] = lag_views.rolling(window=MAX_WINDOW, min_periods=0).count()
+    # 3. Сдвигаем и считаем среднее по числу
+    lag_date_diffs = date_diffs_days.shift(1)
+    df['hist_post_freq'] = lag_date_diffs.rolling(window=WINDOW_LONG, min_periods=1).mean()
+
+    # --- Views ---
+    roller_15 = lag_views.rolling(window=WINDOW_LONG, min_periods=1)
+    df['hist_median_views'] = roller_15.median()
+    df['hist_mean_views'] = roller_15.mean()
+    df['hist_std_views'] = roller_15.std()
+
+    roller_4 = lag_views.rolling(window=WINDOW_SHORT, min_periods=1)
+    median_4 = roller_4.median()
+    df['hist_trend_views'] = median_4 / (df['hist_median_views'] + 1e-5)
+
+    # --- Likes & ER ---
+    df['hist_median_likes'] = lag_likes.rolling(window=WINDOW_LONG, min_periods=1).median()
+    prev_er = (lag_likes + lag_comments) / (lag_views + 1)
+    df['hist_avg_er'] = prev_er.rolling(window=WINDOW_LONG, min_periods=1).mean()
+
+    # --- Размер истории ---
+    df['hist_window_size'] = grouped.cumcount()
 
     # ==========================================
-    # 🩹 ЧАСТЬ 3: IMPUTATION (Заполнение пустот)
+    # ✂️ ФИЛЬТРАЦИЯ И ЗАГЛУШКИ
     # ==========================================
-    print("🩹 Заполнение пропусков (Imputation)...")
+    print("⚖️ Фильтрация и Импутация...")
+
+    # 1. Логика "Старичков"
+    mask_keep = (df['total_videos_count'] < 15) | (df['hist_window_size'] >= 4)
     
-    # is_new_account теперь ставим, если истории ВООБЩЕ нет (window_size == 0)
-    # Или можно оставить < 3 как логический флаг, но данные уже будут заполнены
-    df['is_new_account'] = (df['hist_window_size'] == 0).astype(int)
+    print(f"   Было строк: {len(df)}")
+    df = df[mask_keep].copy()
+    print(f"   Стало строк: {len(df)}")
+
+    # 2. Логика "Новичков" (заглушки на 0 и 1 видео)
+    mask_impute = df['hist_window_size'] < 2
     
-    # Словарь заполнения (Сработает только для самых первых видео аккаунтов)
     values_map = {
-        'hist_median_views': DEFAULT_VIEWS,
-        'hist_mean_views': DEFAULT_VIEWS,
-        'hist_std_views': 0.0,      # Если 1 видео, отклонение 0
-        'hist_trend_views': DEFAULT_TREND,
-        'hist_median_likes': 0.0,
-        'hist_avg_er': DEFAULT_ER,
-        'hist_days_since_last': DEFAULT_DAYS
+        'hist_median_views': DEFAULT_VIEWS, 'hist_mean_views': DEFAULT_VIEWS,
+        'hist_std_views': 0.0, 'hist_trend_views': DEFAULT_TREND,
+        'hist_median_likes': DEFAULT_LIKES, 'hist_avg_er': DEFAULT_ER,
+        'hist_post_freq': DEFAULT_FREQ #'hist_days_since_last': DEFAULT_DAYS
     }
-    df = df.fillna(value=values_map)
-
-    # ==========================================
-    # 📐 ЧАСТЬ 4: LOG1P ДЛЯ АБСОЛЮТНЫХ АГРЕГАТОВ
-    # ==========================================
-    # Логарифмируем только абсолютные величины после расчётов и импутации,
-    # оставляя тренд/ER в исходной шкале.
-    log_cols = [
-        'hist_median_views',
-        'hist_mean_views',
-        'hist_std_views',
-        'hist_median_likes'
-    ]
-    for col in log_cols:
+    
+    for col, val in values_map.items():
         if col in df.columns:
-            df[col] = np.log1p(df[col])
+            df.loc[mask_impute, col] = val
+
+    # 🔥 ОТДЕЛЬНАЯ ОБРАБОТКА ДЛЯ ДНЕЙ 🔥
+    # hist_days_since_last заменяем на -1 ТОЛЬКО там, где он реально NaN.
+    # (Это произойдет само собой только для самого первого видео, window_size=0).
+    # Для второго видео (window_size=1) там уже есть число, и fillna его не тронет.
+    df['hist_days_since_last'] = df['hist_days_since_last'].fillna(DEFAULT_DAYS)
 
     # ==========================================
-    # 💾 СОХРАНЕНИЕ
+    # 🚩 IS_NEW_ACCOUNT
     # ==========================================
-    # Приводим ID к строке для безопасности
+    # Новый = меньше 15 видео всего
+    df['is_new_account'] = (df['total_videos_count'] < 15).astype(int)
+
+    # ==========================================
+    # 📐 ЛОГАРИФМЫ И СОХРАНЕНИЕ
+    # ==========================================
+    print("📐 Финализация...")
+    
+    log_cols = ['hist_median_views', 'hist_mean_views', 'hist_std_views', 'hist_median_likes']
+    for col in log_cols:
+        df[col] = np.log1p(df[col].clip(lower=0))
+
+    df['target_views_log'] = np.log1p(df['views'])
+
+    # 3. 🔥 ДОБАВЛЯЕМ ВСПОМОГАТЕЛЬНЫЕ ТАРГЕТЫ (на будущее) 🔥
+    # clip(lower=0) защищает от случайных -1, если они вдруг просочились
+    df['target_likes_log'] = np.log1p(df['likes'].clip(lower=0))
+    df['target_comments_log'] = np.log1p(df['comments'].clip(lower=0))
+
     df['video_id'] = df['video_id'].astype(str)
     df['account_id'] = df['account_id'].astype(str)
+
+    cols_to_save = [
+        'account_id', 'video_id', 'upload_date', 'video_text', 'target_likes_log', 'target_comments_log',
+        'target_views_log', 'st_hist_total_posts', 'is_new_account',
+        'hist_window_size', 'hist_days_since_last', 'hist_post_freq',
+        'hist_median_views', 'hist_mean_views', 'hist_std_views',
+        'hist_trend_views', 'hist_median_likes', 'hist_avg_er',
+        'raw_followers', 'raw_following', 'raw_bio', 'st_is_verified', 'st_is_business'
+    ]
     
-    print(f"💾 Сохраняем промежуточный файл: {OUTPUT_PARQUET}")
-    print(f"📊 Размер датасета: {df.shape}")
-    
-    # Проверка на дурака (вывод пары строк)
-    print("\n🔍 Пример данных (Window Size = 1):")
-    print(df[df['hist_window_size'] == 1][['account_id', 'views', 'hist_median_views', 'hist_trend_views']].head(2))
-    
-    df.to_parquet(OUTPUT_PARQUET, index=False)
-    print("\n✅ TASK 3 DONE! Файл готов для ML.")
+    final_cols = [c for c in cols_to_save if c in df.columns]
+    df_final = df[final_cols]
+
+    print(f"💾 Сохраняем: {OUTPUT_PARQUET}")
+    df_final.to_parquet(OUTPUT_PARQUET, index=False)
+    print("✅ ГОТОВО! Ошибка Timedelta исправлена.")
 
 if __name__ == "__main__":
-    run_sliding_window_task()
+    run_feature_engineering_v5()
