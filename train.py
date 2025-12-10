@@ -7,12 +7,20 @@ import logging
 import joblib
 from pathlib import Path
 
-# ... (все конфиги и функция preprocess_data без изменений) ...
-# --- КОНФИГУРАЦІЯ ---
+# --- КОНФИГУРАЦИЯ ---
 INPUT_FILE = "dataset_v0_complete.parquet"
 MODEL_SAVE_DIR = "XGBoost/artifacts_real_clean_data"
 TARGET_COL = 'target_views_log'
 GROUP_COL = 'account_id'
+
+# --- 🔥 НАСТРОЙКА ФИЧЕЙ (Черный список) 🔥 ---
+# Сюда пиши названия колонок, которые ты хочешь ИСКЛЮЧИТЬ из обучения.
+# Например, если считаешь, что они шумят.
+IGNORE_COLS = [
+    'hist_days_since_last',
+    'st_is_verified',
+    'st_log_followers'
+]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,41 +34,74 @@ MODEL_PARAMS = {
 
 def preprocess_data(df, fill_values=None):
     df_clean = df.copy()
+    
     if fill_values is None:
-        global_median_views = df['hist_median_views'].median()
-        if pd.isna(global_median_views): global_median_views = 300.0
-        fill_values = {
-            'hist_median_views': global_median_views, 'hist_mean_views': global_median_views,
-            'hist_std_views': df['hist_std_views'].median(), 'hist_median_likes': df['hist_median_likes'].median(),
-            'hist_avg_er': df['hist_avg_er'].median(), 'hist_trend_views': 1.0,
-            'hist_days_since_last': df['hist_days_since_last'].median()
-        }
+        fill_values = {}
+        
+        # 1. Логика для Views (Основная заглушка)
+        # Если hist_median_views есть, считаем медиану, иначе дефолт 300
+        if 'hist_median_views' in df.columns:
+            global_median_views = df['hist_median_views'].median()
+            if pd.isna(global_median_views): global_median_views = 300.0
+            fill_values['hist_median_views'] = global_median_views
+        else:
+            global_median_views = 300.0 # На случай, если и эту колонку удалили
+            
+        if 'hist_mean_views' in df.columns:
+            fill_values['hist_mean_views'] = global_median_views
+
+        # 2. Динамический расчет медиан для остальных колонок
+        # Мы проверяем: "А есть ли эта колонка вообще?", прежде чем считать
+        potential_cols = [
+            'hist_std_views', 'hist_median_likes', 
+            'hist_avg_er', 'hist_days_since_last'
+        ]
+        
+        for col in potential_cols:
+            if col in df.columns:
+                fill_values[col] = df[col].median()
+
+        # 3. Хардкод (Тренд)
+        if 'hist_trend_views' in df.columns:
+            fill_values['hist_trend_views'] = 1.0
+
+        # Защита от NaN в самих медианах
         for k, v in fill_values.items():
             if pd.isna(v): fill_values[k] = 0.0
+            
         return_stats = True
     else:
         return_stats = False
+        
     df_clean = df_clean.fillna(value=fill_values)
+    
     if return_stats:
         return df_clean, fill_values
     return df_clean
 
 def smape(y_true, y_pred):
-    """
-    Расчет SMAPE (Symmetric Mean Absolute Percentage Error).
-    """
     numerator = np.abs(y_pred - y_true)
-    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2 # Делим на 2 для классической формулы
-    # Используем where, чтобы избежать деления на ноль, если оба значения 0
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
     ratio = np.where(denominator == 0, 0, numerator / denominator)
     return np.mean(ratio) * 100
 
 def train_model(df, save_path=None):
     logger.info("Настройка обучения модели...")
+    
+    # 1. Автоматический отбор всех потенциальных фичей
     feature_cols = [c for c in df.columns if c.startswith('st_') or c.startswith('hist_') or c == 'is_new_account']
+    
+    # 2. Фильтрация через Черный список (IGNORE_COLS)
+    feature_cols = [c for c in feature_cols if c not in IGNORE_COLS]
+    
+    if IGNORE_COLS:
+        logger.info(f"🚫 ИГНОРИРУЕМ колонки: {IGNORE_COLS}")
+        
     X = df[feature_cols]
     y = df[TARGET_COL]
     groups = df[GROUP_COL]
+    
+    logger.info(f"✅ Используем фичей ({len(feature_cols)}): {feature_cols}")
     
     n_splits = 5
     gkf = GroupKFold(n_splits=n_splits)
@@ -84,7 +125,6 @@ def train_model(df, save_path=None):
         rmse = np.sqrt(mean_squared_error(y_val, preds))
         r2 = r2_score(y_val, preds)
         
-        # --- Используем SMAPE ---
         real_views = np.expm1(y_val)
         pred_views = np.expm1(preds)
         s_mape = smape(real_views, pred_views)
@@ -105,7 +145,6 @@ def train_model(df, save_path=None):
     logger.info(f"CV Results: Mean SMAPE = {avg_smape:.2f}%")
     print("-" * 40)
     
-    # ... (остальная часть без изменений)
     logger.info("Обучение финальной модели на всех данных...")
     X_full_clean, full_fill_stats = preprocess_data(X)
     

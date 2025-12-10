@@ -18,7 +18,7 @@ DEFAULT_FREQ = 0.0
 DEFAULT_TREND = 1.0
 
 def run_feature_engineering_v5():
-    print("🚀 Запуск Feature Engineering (V5.1: Fix Timedelta error)...")
+    print("🚀 Запуск Feature Engineering (V5.3: Filter Real Zeros)...")
 
     # 1. Загрузка
     print(f"📥 Читаем {INPUT_FILE}...")
@@ -46,18 +46,11 @@ def run_feature_engineering_v5():
     lag_date = grouped['upload_date'].shift(1)
 
     # --- Days Since Last ---
-    # Тут все ок, мы сразу конвертируем в секунды
     df['hist_days_since_last'] = (df['upload_date'] - lag_date).dt.total_seconds() / 86400
 
-    # --- Post Frequency (FIX HERE) ---
-    # 1. Считаем разницу дат
+    # --- Post Frequency ---
     date_diffs = grouped['upload_date'].diff()
-    
-    # 2. 🔥 ПРЕВРАЩАЕМ В ЧИСЛО (ДНИ) СРАЗУ 🔥
-    # Pandas не умеет делать rolling().mean() над типом Timedelta
     date_diffs_days = date_diffs.dt.total_seconds() / 86400
-    
-    # 3. Сдвигаем и считаем среднее по числу
     lag_date_diffs = date_diffs_days.shift(1)
     df['hist_post_freq'] = lag_date_diffs.rolling(window=WINDOW_LONG, min_periods=1).mean()
 
@@ -86,35 +79,43 @@ def run_feature_engineering_v5():
 
     # 1. Логика "Старичков"
     mask_keep = (df['total_videos_count'] < 15) | (df['hist_window_size'] >= 4)
-    
     print(f"   Было строк: {len(df)}")
     df = df[mask_keep].copy()
-    print(f"   Стало строк: {len(df)}")
+    print(f"   Стало строк (после обрезки начала): {len(df)}")
 
-    # 2. Логика "Новичков" (заглушки на 0 и 1 видео)
+    # 2. Логика "Новичков" (заглушки)
     mask_impute = df['hist_window_size'] < 2
     
     values_map = {
         'hist_median_views': DEFAULT_VIEWS, 'hist_mean_views': DEFAULT_VIEWS,
         'hist_std_views': 0.0, 'hist_trend_views': DEFAULT_TREND,
         'hist_median_likes': DEFAULT_LIKES, 'hist_avg_er': DEFAULT_ER,
-        'hist_post_freq': DEFAULT_FREQ #'hist_days_since_last': DEFAULT_DAYS
+        'hist_post_freq': DEFAULT_FREQ
     }
     
     for col, val in values_map.items():
         if col in df.columns:
             df.loc[mask_impute, col] = val
 
-    # 🔥 ОТДЕЛЬНАЯ ОБРАБОТКА ДЛЯ ДНЕЙ 🔥
-    # hist_days_since_last заменяем на -1 ТОЛЬКО там, где он реально NaN.
-    # (Это произойдет само собой только для самого первого видео, window_size=0).
-    # Для второго видео (window_size=1) там уже есть число, и fillna его не тронет.
+    # Отдельная обработка для дней
     df['hist_days_since_last'] = df['hist_days_since_last'].fillna(DEFAULT_DAYS)
+
+    # --- 🔥 НОВЫЙ БЛОК: УДАЛЕНИЕ МЕРТВЫХ ДУШ 🔥 ---
+    print("🧹 Очистка: Удаляем видео с РЕАЛЬНЫМ нулем в медиане лайков...")
+    initial_len = len(df)
+    
+    # Удаляем, если (Лайков в истории 0) И (Это НЕ заглушка, т.е. history >= 2)
+    # Заглушки для новичков (history < 2) не трогаем, им положено быть с нулем.
+    mask_dead_accounts = (df['hist_median_likes'] == 0) & (df['hist_window_size'] >= 2)
+    
+    df = df[~mask_dead_accounts].copy()
+    
+    dropped = initial_len - len(df)
+    print(f"   ✂️ Удалено {dropped} строк (мертвые аккаунты без лайков).")
 
     # ==========================================
     # 🚩 IS_NEW_ACCOUNT
     # ==========================================
-    # Новый = меньше 15 видео всего
     df['is_new_account'] = (df['total_videos_count'] < 15).astype(int)
 
     # ==========================================
@@ -127,9 +128,8 @@ def run_feature_engineering_v5():
         df[col] = np.log1p(df[col].clip(lower=0))
 
     df['target_views_log'] = np.log1p(df['views'])
-
-    # 3. 🔥 ДОБАВЛЯЕМ ВСПОМОГАТЕЛЬНЫЕ ТАРГЕТЫ (на будущее) 🔥
-    # clip(lower=0) защищает от случайных -1, если они вдруг просочились
+    
+    # Доп. таргеты
     df['target_likes_log'] = np.log1p(df['likes'].clip(lower=0))
     df['target_comments_log'] = np.log1p(df['comments'].clip(lower=0))
 
@@ -137,8 +137,9 @@ def run_feature_engineering_v5():
     df['account_id'] = df['account_id'].astype(str)
 
     cols_to_save = [
-        'account_id', 'video_id', 'upload_date', 'video_text', 'target_likes_log', 'target_comments_log',
-        'target_views_log', 'st_hist_total_posts', 'is_new_account',
+        'account_id', 'video_id', 'upload_date', 'video_text',
+        'target_views_log', 'target_likes_log', 'target_comments_log',
+        'st_hist_total_posts', 'is_new_account',
         'hist_window_size', 'hist_days_since_last', 'hist_post_freq',
         'hist_median_views', 'hist_mean_views', 'hist_std_views',
         'hist_trend_views', 'hist_median_likes', 'hist_avg_er',
@@ -150,7 +151,7 @@ def run_feature_engineering_v5():
 
     print(f"💾 Сохраняем: {OUTPUT_PARQUET}")
     df_final.to_parquet(OUTPUT_PARQUET, index=False)
-    print("✅ ГОТОВО! Ошибка Timedelta исправлена.")
+    print("✅ ГОТОВО! V5.3 (Clean Zeros).")
 
 if __name__ == "__main__":
     run_feature_engineering_v5()
