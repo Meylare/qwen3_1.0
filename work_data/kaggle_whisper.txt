@@ -6,6 +6,7 @@
 import pandas as pd
 import os
 import time
+import json
 from pathlib import Path
 from tqdm import tqdm
 from google.cloud import storage
@@ -15,37 +16,82 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import math
 
-# --- ⚙️ НАСТРОЙКИ ДЛЯ КОМАНДНОЙ РАБОТЫ ⚙️ ---
-# 1. Сколько человек участвует? (Если ты и друг, ставь 2)
+# ==========================================
+# ⚙️ НАСТРОЙКИ (МЕНЯТЬ ЗДЕСЬ)
+# ==========================================
 TOTAL_HUMANS = 2 
-
-# 2. Кто запускает этот скрипт? (Меняйте это число!)
-# Ты ставишь 0
-# Друг ставит 1
-MY_WORKER_ID = 0  
-
-# 3. Уникальное имя файла для каждого (чтобы не перезатереть друг друга)
-# Например: "transcriptions_part0.parquet" и "transcriptions_part1.parquet"
-OUTPUT_FILE_NAME = f"transcriptions_part{MY_WORKER_ID}.parquet"
-
-# --- ОСТАЛЬНАЯ КОНФИГУРАЦИЯ ---
-BUCKET_NAME = "slon_bucket2"
-AUDIO_PREFIX = "audio_wav_16kHz/"
+MY_WORKER_ID = 0  # <--- ТЫ: 0, ДРУГ: 1
+BUCKET_NAME = "slon_bucket2"  # <--- ИМЯ ТВОЕГО БАКЕТА
 
 # Настройки модели
 MODEL_SIZE = "large-v3"
-COMPUTE_TYPE = "int8"
+COMPUTE_TYPE = "int8" # Для T4 лучше float16
 
+# Пути
+AUDIO_PREFIX = "audio_wav_16kHz/"
+OUTPUT_FILE_NAME = f"transcriptions_part{MY_WORKER_ID}.parquet"
 TEMP_DIR = Path("temp_audio")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Глобальный лок для принтов
+# ==========================================
+# 🚫 ФИЛЬТРЫ ГАЛЛЮЦИНАЦИЙ
+# ==========================================
+TOXIC_PHRASES = [
+    "subtitles by", "субтитры", "provided by", "сделал",
+    "captioned by", "translated by", 
+    "amara.org", "opensubtitles", "dimatorzok",
+    "[music]", "(music)", "musikk", "[sound]", "(sound)",
+    "applause", "cheering", "dramatisk", "background music",
+    "copyright", "©", "🎵", "🎼", "♪"
+]
+
+CLICHE_PHRASES = [
+    "thanks for watching", "спасибо за просмотр", "thanks for",
+    "welcome to my channel", "subscribe", "подпишись",
+    "like and subscribe", "лайк и подписка", "thank you for watching"
+]
+
+NO_SPEECH_THRESHOLD = 0.9
+NO_SPEECH_TOKEN = "<NO_SPEECH>"
+
+# Лок для принтов, чтобы потоки не мешали друг другу писать в консоль
 print_lock = threading.Lock()
 
 def safe_print(msg):
     with print_lock:
         print(msg)
 
+def is_clean_segment(segment):
+    """Проверяет текст на мусор и галлюцинации"""
+    # 1. Вероятность тишины
+    if segment.no_speech_prob > NO_SPEECH_THRESHOLD:
+        return False
+
+    text = segment.text.strip().lower()
+    
+    # 2. Слишком короткий
+    if len(text) < 2:
+        return False
+
+    # 3. Токсичные фразы (удаляем всегда)
+    for bad_phrase in TOXIC_PHRASES:
+        if bad_phrase in text:
+            return False
+
+    # 4. Клише (удаляем, если фраза короткая)
+    for cliche in CLICHE_PHRASES:
+        if cliche in text:
+            if len(text) < 40: return False
+            
+    # 5. Нет букв
+    has_letters = any(c.isalpha() for c in text)
+    if not has_letters: return False
+
+    return True
+
+# ==========================================
+# ☁️ GCS HELPERS
+# ==========================================
 def setup_gcs_auth():
     user_secrets = UserSecretsClient()
     try:
@@ -55,7 +101,7 @@ def setup_gcs_auth():
             f.write(key_content)
         return key_path
     except Exception as e:
-        safe_print(f"❌ Ошибка секрета: {e}")
+        safe_print(f"❌ Ошибка секрета GCP_KEY: {e}")
         return None
 
 def get_gcs_client(key_path):
@@ -69,15 +115,16 @@ def sync_from_gcs(bucket, filename):
     return pd.DataFrame(columns=["video_id", "text", "language", "duration"])
 
 def save_chunk_to_gcs(df, bucket, base_filename, gpu_id):
-    # Добавляем суффикс GPU к имени файла воркера
-    # Пример: transcriptions_part0_gpu1.parquet
     filename = f"{base_filename.replace('.parquet', '')}_gpu{gpu_id}.parquet"
     df.to_parquet(filename, index=False)
     blob = bucket.blob(filename)
     blob.upload_from_filename(filename)
 
+# ==========================================
+# 🧠 GPU WORKER
+# ==========================================
 def process_chunk(gpu_id, files, key_path):
-    """Воркер для одной видеокарты"""
+    """Работает на одной конкретной видеокарте"""
     if not files:
         safe_print(f"💤 [GPU {gpu_id}] Нет задач.")
         return
@@ -106,34 +153,67 @@ def process_chunk(gpu_id, files, key_path):
             blob = bucket.blob(blob_name)
             blob.download_to_filename(local_wav_path)
             
+            # --- ТРАНСКРИБАЦИЯ ---
             segments, info = model.transcribe(str(local_wav_path), beam_size=5)
-            full_text = " ".join([segment.text for segment in segments]).strip()
+            
+            # Реальная длительность аудио
+            video_duration = info.duration
+            
+            clean_segments_data = []
+            for segment in segments:
+                # --- 🔥 ФИЛЬТР ПО ВРЕМЕНИ 🔥 ---
+                # Если фраза начинается ПОСЛЕ конца видео (с буфером 0.5с) -> Галлюцинация
+                if segment.start > (video_duration + 1):
+                    continue
+                
+                # Обрезаем конец фразы, если он вылез за пределы видео
+                real_end = min(round(segment.end, 2), round(video_duration, 2))
+                
+                # Применяем фильтр по тексту
+                if is_clean_segment(segment):
+                    clean_segments_data.append({
+                        "start": round(segment.start, 2),
+                        "end": real_end,
+                        "text": segment.text.strip()
+                    })
+            
+            # --- ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ---
+            if clean_segments_data:
+                # Есть текст -> JSON
+                final_text_val = json.dumps(clean_segments_data, ensure_ascii=False)
+            else:
+                # Нет текста -> ТОКЕН
+                final_text_val = NO_SPEECH_TOKEN
             
             local_results.append({
                 "video_id": video_id,
-                "text": full_text,
+                "text": final_text_val,
                 "language": info.language,
                 "duration": info.duration
             })
 
         except Exception:
-            pass 
+            pass # Игнорируем битые файлы
         finally:
             if local_wav_path.exists(): os.remove(local_wav_path)
 
+        # Сохранение пачками
         if len(local_results) % SAVE_EVERY == 0:
             df_chunk = pd.DataFrame(local_results)
             save_chunk_to_gcs(df_chunk, bucket, OUTPUT_FILE_NAME, gpu_id)
 
+    # Финальное сохранение остатка
     if local_results:
         df_chunk = pd.DataFrame(local_results)
         save_chunk_to_gcs(df_chunk, bucket, OUTPUT_FILE_NAME, gpu_id)
         
     safe_print(f"🏁 [GPU {gpu_id}] Завершил работу.")
 
+# ==========================================
+# 🎮 MAIN CONTROLLER
+# ==========================================
 def run_coop_transcription():
-    print(f"🔥 ЗАПУСК CO-OP РЕЖИМА | ИГРОК {MY_WORKER_ID + 1} из {TOTAL_HUMANS} 🔥")
-    print(f"📂 Мой файл результата: {OUTPUT_FILE_NAME}")
+    print(f"🔥 ЗАПУСК CO-OP (ULTIMATE) | ИГРОК {MY_WORKER_ID + 1} из {TOTAL_HUMANS} 🔥")
     
     key_path = setup_gcs_auth()
     if not key_path: return
@@ -141,7 +221,7 @@ def run_coop_transcription():
     client = get_gcs_client(key_path)
     bucket = client.bucket(BUCKET_NAME)
 
-    # 1. Проверяем, что Я уже сделал (мои gpu0 и gpu1 файлы)
+    # 1. Проверяем, что Я уже сделал (Resume logic)
     done_ids = set()
     for g in [0, 1]:
         fname = f"{OUTPUT_FILE_NAME.replace('.parquet', '')}_gpu{g}.parquet"
@@ -151,7 +231,7 @@ def run_coop_transcription():
             
     print(f"✅ Я уже сделал ранее: {len(done_ids)} видео.")
 
-    # 2. Скачиваем ПОЛНЫЙ список файлов
+    # 2. Скачиваем список всех файлов
     print("🔎 Сканируем бакет...")
     blobs = bucket.list_blobs(prefix=AUDIO_PREFIX)
     all_wavs = sorted([b.name for b in blobs if b.name.endswith(".wav")])
@@ -159,20 +239,14 @@ def run_coop_transcription():
     total_files = len(all_wavs)
     print(f"📚 Всего файлов в бакете: {total_files}")
 
-    # 3. ДЕЛИМ ПИЦЦУ (Global Split)
-    # Вычисляем мою долю
+    # 3. Делим пиццу (Global Split)
     chunk_size = math.ceil(total_files / TOTAL_HUMANS)
     start_idx = MY_WORKER_ID * chunk_size
     end_idx = min((MY_WORKER_ID + 1) * chunk_size, total_files)
     
     my_global_tasks = all_wavs[start_idx:end_idx]
     
-    print("-" * 40)
-    print(f"🍕 Мой кусок пиццы: с {start_idx} по {end_idx}")
-    print(f"📋 Всего мне поручено: {len(my_global_tasks)} файлов")
-    print("-" * 40)
-
-    # 4. Фильтруем то, что я уже сделал
+    # 4. Фильтруем то, что уже готово
     tasks_to_do = []
     for path in my_global_tasks:
         vid = path.split('/')[-1].replace('.wav', '')
@@ -182,22 +256,22 @@ def run_coop_transcription():
     print(f"🔥 Мне осталось сделать: {len(tasks_to_do)}")
     
     if not tasks_to_do:
-        print("🎉 Моя часть работы выполнена! Можно пить чай.")
+        print("🎉 Моя часть работы выполнена! Можно отдыхать.")
         return
 
-    # 5. Делим на мои 2 GPU (Local Split)
+    # 5. Делим на 2 GPU (Local Split)
     mid = len(tasks_to_do) // 2
     tasks_gpu0 = tasks_to_do[:mid]
     tasks_gpu1 = tasks_to_do[mid:]
 
-    # 6. Погнали
+    # 6. Запуск потоков
     with ThreadPoolExecutor(max_workers=2) as executor:
         f0 = executor.submit(process_chunk, 0, tasks_gpu0, key_path)
         f1 = executor.submit(process_chunk, 1, tasks_gpu1, key_path)
         f0.result()
         f1.result()
 
-    print("\n🎉🎉🎉 СЕССИЯ ЗАВЕРШЕНА! Не забудь объединить файлы в конце.")
+    print("\n🎉🎉🎉 СЕССИЯ ЗАВЕРШЕНА!")
 
 if __name__ == "__main__":
     run_coop_transcription()

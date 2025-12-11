@@ -17,3 +17,4 @@ venv/
 temp_processing/
 *.mp4
 *.wav
+check_text.py
