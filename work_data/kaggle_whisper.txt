@@ -124,7 +124,7 @@ def save_chunk_to_gcs(df, bucket, base_filename, gpu_id):
 # 🧠 GPU WORKER
 # ==========================================
 def process_chunk(gpu_id, files, key_path):
-    """Работает на одной конкретной видеокарте"""
+    """Воркер для одной видеокарты (с правильным дописыванием)"""
     if not files:
         safe_print(f"💤 [GPU {gpu_id}] Нет задач.")
         return
@@ -134,13 +134,20 @@ def process_chunk(gpu_id, files, key_path):
     client = get_gcs_client(key_path)
     bucket = client.bucket(BUCKET_NAME)
     
+    # --- 🔥 FIX #1: Загружаем предыдущий результат для этого GPU ---
+    # Определяем имя файла, за который отвечает этот воркер
+    chunk_filename = f"{OUTPUT_FILE_NAME.replace('.parquet', '')}_gpu{gpu_id}.parquet"
+    # Скачиваем то, что уже успели сделать
+    df_chunk_results = sync_from_gcs(bucket, chunk_filename)
+    
     try:
         model = WhisperModel(MODEL_SIZE, device="cuda", device_index=[gpu_id], compute_type=COMPUTE_TYPE)
     except Exception as e:
         safe_print(f"❌ [GPU {gpu_id}] Ошибка загрузки модели: {e}")
         return
 
-    local_results = []
+    # Буфер для НОВЫХ результатов
+    new_rows = []
     SAVE_EVERY = 50
     
     pbar = tqdm(files, desc=f"GPU {gpu_id}", position=gpu_id, leave=True)
@@ -153,23 +160,17 @@ def process_chunk(gpu_id, files, key_path):
             blob = bucket.blob(blob_name)
             blob.download_to_filename(local_wav_path)
             
-            # --- ТРАНСКРИБАЦИЯ ---
             segments, info = model.transcribe(str(local_wav_path), beam_size=5)
             
-            # Реальная длительность аудио
             video_duration = info.duration
             
             clean_segments_data = []
             for segment in segments:
-                # --- 🔥 ФИЛЬТР ПО ВРЕМЕНИ 🔥 ---
-                # Если фраза начинается ПОСЛЕ конца видео (с буфером 0.5с) -> Галлюцинация
                 if segment.start > (video_duration + 1):
                     continue
                 
-                # Обрезаем конец фразы, если он вылез за пределы видео
                 real_end = min(round(segment.end, 2), round(video_duration, 2))
                 
-                # Применяем фильтр по тексту
                 if is_clean_segment(segment):
                     clean_segments_data.append({
                         "start": round(segment.start, 2),
@@ -177,15 +178,13 @@ def process_chunk(gpu_id, files, key_path):
                         "text": segment.text.strip()
                     })
             
-            # --- ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ---
             if clean_segments_data:
-                # Есть текст -> JSON
                 final_text_val = json.dumps(clean_segments_data, ensure_ascii=False)
             else:
-                # Нет текста -> ТОКЕН
                 final_text_val = NO_SPEECH_TOKEN
             
-            local_results.append({
+            # Добавляем в буфер НОВЫХ строк
+            new_rows.append({
                 "video_id": video_id,
                 "text": final_text_val,
                 "language": info.language,
@@ -193,22 +192,29 @@ def process_chunk(gpu_id, files, key_path):
             })
 
         except Exception:
-            pass # Игнорируем битые файлы
+            pass
         finally:
             if local_wav_path.exists(): os.remove(local_wav_path)
 
-        # Сохранение пачками
-        if len(local_results) % SAVE_EVERY == 0:
-            df_chunk = pd.DataFrame(local_results)
-            save_chunk_to_gcs(df_chunk, bucket, OUTPUT_FILE_NAME, gpu_id)
+        # --- 🔥 FIX #2: Логика сохранения ---
+        if len(new_rows) >= SAVE_EVERY:
+            # 1. Создаем DataFrame из новых строк
+            df_new = pd.DataFrame(new_rows)
+            # 2. Добавляем их к тому, что уже было загружено
+            df_chunk_results = pd.concat([df_chunk_results, df_new], ignore_index=True)
+            # 3. Сохраняем объединенный результат
+            save_chunk_to_gcs(df_chunk_results, bucket, OUTPUT_FILE_NAME, gpu_id)
+            # 4. Очищаем буфер
+            new_rows = []
 
     # Финальное сохранение остатка
-    if local_results:
-        df_chunk = pd.DataFrame(local_results)
-        save_chunk_to_gcs(df_chunk, bucket, OUTPUT_FILE_NAME, gpu_id)
+    if new_rows:
+        df_new = pd.DataFrame(new_rows)
+        df_chunk_results = pd.concat([df_chunk_results, df_new], ignore_index=True)
+        save_chunk_to_gcs(df_chunk_results, bucket, OUTPUT_FILE_NAME, gpu_id)
         
     safe_print(f"🏁 [GPU {gpu_id}] Завершил работу.")
-
+    
 # ==========================================
 # 🎮 MAIN CONTROLLER
 # ==========================================
