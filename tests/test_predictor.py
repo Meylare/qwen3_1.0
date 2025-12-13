@@ -5,7 +5,7 @@ import os
 # Добавляем корневую папку в путь, чтобы питон видел src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.baseline.models.predictor import ViralPredictor
+from src.models.components import ViralPredictor
 
 def test_viral_predictor():
     print("🚀 Запуск теста ViralPredictor (The Judge)...")

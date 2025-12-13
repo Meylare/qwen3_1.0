@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-# Импорт по твоему пути
-from statistic.features_lib import extract_static
+# Импорт локального модуля
+from .statistic.features_lib import extract_static
 
 # --- КОНФИГУРАЦИЯ ---
 INPUT_HISTORY = "full_history_features.parquet"

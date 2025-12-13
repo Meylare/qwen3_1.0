@@ -13,7 +13,6 @@ from .components import (
 
 from .g2v2_model import (
     G2V2Model,
-    G2V2,  # Алиас для G2V2Model
 )
 
 # Алиас для AudioProjector (то же самое, что Projector)
@@ -29,5 +28,4 @@ __all__ = [
     'AudioProjector',
     # Модели
     'G2V2Model',
-    'G2V2',
 ]
