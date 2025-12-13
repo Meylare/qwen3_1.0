@@ -230,12 +230,24 @@ class G2V2Model(nn.Module):
         )
         
         # 6. Pooling (Последний токен)
-        last_hidden = outputs.hidden_states[-1]
+        # Получаем последний скрытый слой
+        if hasattr(outputs, 'last_hidden_state'):
+            last_hidden = outputs.last_hidden_state
+        elif hasattr(outputs, 'hidden_states'):
+            last_hidden = outputs.hidden_states[-1]
+        else:
+            # Fallback для разных версий transformers
+            last_hidden = outputs[0] if isinstance(outputs, tuple) else outputs
         
         # Находим индекс последнего реального токена (не паддинга)
         # final_mask имеет форму [B, Seq_Len]. Сумма по строке - 1 дает индекс последнего токена.
         seq_lengths = final_mask.sum(dim=1) - 1
-        pooled_output = last_hidden[torch.arange(last_hidden.shape[0]), seq_lengths]
+        
+        # ИСПРАВЛЕНИЕ: Явно указываем device для torch.arange, чтобы он был на том же устройстве, что и last_hidden
+        batch_indices = torch.arange(last_hidden.shape[0], device=last_hidden.device)
+        
+        # Теперь оба индекса на одном устройстве — ошибки не будет
+        pooled_output = last_hidden[batch_indices, seq_lengths]
         
         # 7. Выход в зависимости от задачи
         if task_type == "score":
