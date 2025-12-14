@@ -1,199 +1,258 @@
 import os
-import glob
 import json
-import zipfile
 import io
+import zipfile
+from pathlib import Path
+from tqdm import tqdm
+from collections import defaultdict
+import subprocess
+import shutil
+
 import torch
 import torchaudio
 import torchaudio.transforms as T
-import laion_clap
-import wget
-import numpy as np
-from tqdm import tqdm
+from laion_clap import CLAP_Module
+from google.cloud import storage
 
-# --- КОНФИГУРАЦИЯ ---
-# Пути к исходным данным (поменяй на свои)
-WAVCAPS_ZIP_FOLDER = "data/raw/wavcaps/zips"   # Папка где лежат .zip файлы
-WAVCAPS_JSON = "data/raw/wavcaps/wavcaps.json" # JSON с описаниями
+# --- Конфигурация ---
+BUCKET_NAME = "твое-название-бакета"
+WAVCAPS_ZIPS_PREFIX = "data/raw/wavcaps/zips/" 
+METADATA_JSON_BLOB_NAME = "data/raw/wavcaps/wavcaps.json"
+OUTPUT_CACHE_PREFIX = "data/processed/clap_cache/"
 
-# Пути к MusicCaps (если есть)
-MUSICCAPS_FOLDER = "data/raw/musiccaps" 
-MUSICCAPS_CSV = "data/raw/musiccaps/musiccaps.csv"
-
-# Куда сохранять результат
-OUTPUT_DIR = "data/processed"
-CHECKPOINT_NAME = "music_audioset_epoch_15_esc_90.14.pt"
-
-# Параметры аудио
-TARGET_SR = 48000     # CLAP требует 48kHz
-MAX_SECONDS = 10      # Максимальная длина аудио
-MAX_LENGTH = TARGET_SR * MAX_SECONDS
-BATCH_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 64
+TARGET_SAMPLE_RATE = 48000
+MAX_AUDIO_SECONDS = 10
+MAX_LENGTH = TARGET_SAMPLE_RATE * MAX_AUDIO_SECONDS
 
-def download_weights_if_needed():
-    """Скачивает правильный чекпоинт для HTSAT-base"""
-    url = "https://huggingface.co/lukewys/laion_clap/resolve/main/music_audioset_epoch_15_esc_90.14.pt"
-    if not os.path.exists(CHECKPOINT_NAME):
-        print(f"⬇️ Скачиваем веса {CHECKPOINT_NAME}...")
-        wget.download(url, CHECKPOINT_NAME)
-        print("\n✅ Скачано.")
-    return CHECKPOINT_NAME
+# Папки на VM (должно быть достаточно места, ~100GB)
+LOCAL_TEMP_DIR = Path("/tmp/audio_processing_temp")
+LOCAL_OUTPUT_DIR = Path("/tmp/audio_processing_output")
 
-def load_clap_model():
-    print(f"🔊 Loading CLAP model on {DEVICE}...")
-    ckpt_path = download_weights_if_needed()
-    
-    # ВАЖНО: amodel='HTSAT-base' соответствует скачанным весам
-    model = laion_clap.CLAP_Module(enable_fusion=False, amodel='HTSAT-base')
-    
-    # Загружаем веса явно
-    model.load_ckpt(ckpt_path)
-    
-    model.to(DEVICE)
-    model.eval()
-    return model
+# --- Вспомогательные функции ---
 
-def process_audio_tensor(waveform, sr):
-    """Приводит аудио к единому формату (48k, mono, 10sec)"""
-    # 1. Resample
-    if sr != TARGET_SR:
-        resampler = T.Resample(sr, TARGET_SR)
-        waveform = resampler(waveform)
+def get_gcs_client():
+    return storage.Client()
+
+def upload_to_gcs(bucket, local_path, gcs_path):
+    print(f"Uploading {local_path} to gs://{bucket.name}/{gcs_path}...")
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path)
+    print("✅ Upload complete.")
+
+def download_from_gcs(bucket, blob_name, local_path):
+    blob = bucket.blob(blob_name)
+    Path(local_path).parent.mkdir(exist_ok=True, parents=True)
+    blob.download_to_filename(local_path)
+    return Path(local_path)
+
+def combine_zip_parts(parts_paths, output_path):
+    """
+    Склеивает части архива (.z01, .z02... .zip) в один файл.
+    Для Info-ZIP обычно .zip идет последним.
+    В Linux проще всего использовать команду `cat`.
+    """
+    # Сортируем: .z01, .z02, ... .zip
+    # Логика сортировки: z01 < z02 < zip
+    def sort_key(p):
+        if str(p).endswith('.zip'): return 'zzz' # В конец
+        return str(p)
     
-    # 2. Mono
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-        
-    # 3. Pad or Trim (Фиксированная длина)
-    # Это критично для батчинга!
+    parts_sorted = sorted(parts_paths, key=sort_key)
+    
+    print(f"Merging {len(parts_sorted)} parts into {output_path}...")
+    
+    # Используем системный cat (быстрее и надежнее для больших файлов)
+    # Команда: cat part1 part2 part3 > output
+    cmd = f"cat {' '.join([str(p) for p in parts_sorted])} > {output_path}"
+    subprocess.run(cmd, shell=True, check=True)
+    
+    # Альтернатива: zip -F (fix) если просто cat не сработает (зависит от типа split)
+    # subprocess.run(["zip", "-F", str(parts_sorted[-1]), "--out", str(output_path)], check=True)
+
+def process_audio_batch(audio_data_list, model):
+    # Превращаем список тензоров в батч
+    batch_tensor = torch.stack(audio_data_list).to(DEVICE)
+    with torch.no_grad():
+        embeddings = model.get_audio_embedding_from_data(x=batch_tensor, use_tensor=True)
+    return embeddings.cpu()
+
+def pad_or_trim(waveform):
     if waveform.shape[1] > MAX_LENGTH:
-        waveform = waveform[:, :MAX_LENGTH]
+        return waveform[:, :MAX_LENGTH]
     elif waveform.shape[1] < MAX_LENGTH:
-        pad_size = MAX_LENGTH - waveform.shape[1]
-        waveform = torch.nn.functional.pad(waveform, (0, pad_size))
-    
-    # Возвращаем [Length] (без канала)
+        pad = MAX_LENGTH - waveform.shape[1]
+        return torch.nn.functional.pad(waveform, (0, pad))
     return waveform.squeeze(0)
 
-def get_wavcaps_mapping(json_path):
-    print("📖 Reading WavCaps JSON...")
-    if not os.path.exists(json_path):
-        print(f"⚠️ JSON not found: {json_path}")
-        return {}
-        
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    
-    mapping = {}
-    # Адаптация под структуру WavCaps (может отличаться)
-    items = data['data'] if 'data' in data else data
-    
-    for item in items:
-        # ID обычно совпадает с именем файла
-        key = str(item['id']) 
-        caption = item['caption']
-        mapping[key] = caption
-    return mapping
+# --- Основная логика ---
 
-def cache_datasets():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def main():
+    print(f"🚀 Запуск. Device: {DEVICE}")
+    LOCAL_TEMP_DIR.mkdir(exist_ok=True, parents=True)
+    LOCAL_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
     
-    # 1. Загрузка модели
-    try:
-        model = load_clap_model()
-    except Exception as e:
-        print(f"❌ Critical Error loading model: {e}")
-        return
+    client = get_gcs_client()
+    bucket = client.bucket(BUCKET_NAME)
+    
+    # 1. Загрузка Модели
+    print("Loading CLAP...")
+    model = CLAP_Module(enable_fusion=False, amodel='HTSAT-base')
+    model.load_ckpt() # Использует скачанный или дефолтный
+    model.to(DEVICE)
+    model.eval()
+    
+    # 2. Метаданные
+    print("Downloading metadata...")
+    local_meta = LOCAL_TEMP_DIR / "meta.json"
+    download_from_gcs(bucket, METADATA_JSON_BLOB_NAME, local_meta)
+    with open(local_meta, 'r') as f:
+        data = json.load(f)
+        items = data['data'] if 'data' in data else data
+        # Словарь: "AudioSet_SL/12345" -> "caption"
+        # Но в зипе имена могут быть просто "12345.flac". 
+        # Сделаем маппинг по ID.
+        metadata = {str(item['id']): item['caption'] for item in items}
+
+    # 3. Сканирование и Группировка
+    print("Listing blobs...")
+    blobs = list(bucket.list_blobs(prefix=WAVCAPS_ZIPS_PREFIX))
+    
+    # Группируем по имени архива (AudioSet_SL.z01 -> AudioSet_SL)
+    archive_groups = defaultdict(list)
+    
+    for blob in blobs:
+        fname = Path(blob.name).name
+        if not (fname.endswith('.zip') or '.z' in fname):
+            continue
+            
+        # Определяем базовое имя
+        if fname.endswith('.zip'):
+            base = fname[:-4]
+        else:
+            # example.z01 -> example
+            base = fname.rsplit('.', 1)[0]
+        
+        archive_groups[base].append(blob)
+    
+    print(f"Found archive groups: {list(archive_groups.keys())}")
 
     all_embeddings = []
     all_captions = []
-    
-    # Буферы
-    batch_audio = []
-    batch_caps = []
 
-    def flush_batch():
-        nonlocal batch_audio, batch_caps
-        if not batch_audio:
-            return
+    # 4. Цикл обработки групп
+    for group_name, group_blobs in tqdm(archive_groups.items(), desc="Groups"):
+        # Создаем папку для этой группы
+        group_dir = LOCAL_TEMP_DIR / group_name
+        group_dir.mkdir(exist_ok=True)
+        
+        # А. Скачивание всех частей
+        local_parts = []
+        for blob in group_blobs:
+            local_path = group_dir / Path(blob.name).name
+            print(f"Downloading {blob.name}...")
+            blob.download_to_filename(local_path)
+            local_parts.append(local_path)
             
-        try:
-            with torch.no_grad():
-                # Стек тензоров [Batch, Length]
-                batch_tensor = torch.stack(batch_audio).to(DEVICE) # Отправляем на GPU
-                
-                # Инференс
-                # use_tensor=True значит мы подаем готовые тензоры, а не пути к файлам
-                embeddings = model.get_audio_embedding_from_data(x=batch_tensor, use_tensor=True)
-                
-                # Сохраняем на CPU
-                all_embeddings.append(embeddings.cpu())
-                all_captions.extend(batch_caps)
-        except Exception as e:
-            print(f"⚠️ Batch processing error: {e}")
-        finally:
-            batch_audio = []
-            batch_caps = []
+        # Б. Склейка
+        full_zip_path = group_dir / "combined.zip"
+        
+        # Если это split-архив (много частей)
+        if len(local_parts) > 1:
+            # Для Info-ZIP часто нужно использовать zip -F
+            # Найдем файл с расширением .zip
+            main_zip_part = next((p for p in local_parts if str(p).endswith('.zip')), None)
+            
+            if main_zip_part:
+                # Используем zip -F для восстановления (надежнее для split archives)
+                # Требует установки: sudo apt-get install zip
+                print("Fixing split archive...")
+                subprocess.run(["zip", "-F", str(main_zip_part), "--out", str(full_zip_path)], check=True)
+            else:
+                # Если просто куски, пробуем cat
+                combine_zip_parts(local_parts, full_zip_path)
+        else:
+            # Если это одиночный zip
+            full_zip_path = local_parts[0]
 
-    # --- WAVCAPS LOOP ---
-    wavcaps_map = get_wavcaps_mapping(WAVCAPS_JSON)
-    zip_files = glob.glob(os.path.join(WAVCAPS_ZIP_FOLDER, "*.zip"))
-    
-    print(f"📦 Processing {len(zip_files)} zip archives...")
-    
-    for zip_path in tqdm(zip_files, desc="Archives"):
+        # В. Чтение и Процессинг
+        print(f"Processing {group_name}...")
+        batch_audio = []
+        batch_caps = []
+        
         try:
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                # Фильтруем только аудио
+            with zipfile.ZipFile(full_zip_path, 'r') as z:
                 files = [f for f in z.namelist() if f.endswith(('.flac', '.wav'))]
                 
-                for filename in files:
-                    # Ищем ID (обычно имя файла без расширения)
-                    file_id = os.path.splitext(os.path.basename(filename))[0]
+                for filename in tqdm(files, leave=False):
+                    # Ищем ID. Обычно это имя файла "12345.flac" -> "12345"
+                    file_id = Path(filename).stem
+                    caption = metadata.get(file_id)
                     
-                    if file_id not in wavcaps_map:
-                        continue
-                        
+                    if not caption: continue
+                    
                     try:
-                        # Читаем в RAM
-                        audio_bytes = z.read(filename)
-                        wav, sr = torchaudio.load(io.BytesIO(audio_bytes))
+                        # Декодирование
+                        with z.open(filename) as audio_file:
+                            # Читаем в BytesIO, чтобы torchaudio съел
+                            buffer = io.BytesIO(audio_file.read())
+                            wav, sr = torchaudio.load(buffer)
                         
-                        # Обрабатываем
-                        processed = process_audio_tensor(wav, sr)
+                        # Обработка (Resample, Mono, Pad)
+                        if sr != TARGET_SAMPLE_RATE:
+                            wav = T.Resample(sr, TARGET_SAMPLE_RATE)(wav)
+                        if wav.shape[0] > 1:
+                            wav = wav.mean(dim=0, keepdim=True)
+                        wav = pad_or_trim(wav)
                         
-                        batch_audio.append(processed)
-                        batch_caps.append(wavcaps_map[file_id])
+                        batch_audio.append(wav)
+                        batch_caps.append(caption)
                         
+                        # Батч готов
                         if len(batch_audio) >= BATCH_SIZE:
-                            flush_batch()
+                            embs = process_audio_batch(batch_audio, model)
+                            all_embeddings.append(embs)
+                            all_captions.extend(batch_caps)
+                            batch_audio, batch_caps = [], []
                             
                     except Exception as e:
-                        # Битое аудио пропускаем
+                        # print(f"Error file {filename}: {e}")
                         continue
                         
+            # Хвост
+            if batch_audio:
+                embs = process_audio_batch(batch_audio, model)
+                all_embeddings.append(embs)
+                all_captions.extend(batch_caps)
+
         except Exception as e:
-            print(f"❌ Error reading zip {zip_path}: {e}")
+            print(f"❌ Failed to process zip {group_name}: {e}")
+            
+        finally:
+            # Г. Очистка диска (Удаляем скачанное)
+            print(f"Cleaning up {group_name}...")
+            shutil.rmtree(group_dir)
 
-    # Обработка хвоста
-    flush_batch()
-    
-    # --- СОХРАНЕНИЕ ---
-    if not all_embeddings:
-        print("❌ No data processed. Check paths!")
-        return
-
-    print("💾 Saving artifacts...")
-    final_tensor = torch.cat(all_embeddings, dim=0) # [Total, 512]
-    
-    torch.save(final_tensor, os.path.join(OUTPUT_DIR, "wavcaps_embeddings.pt"))
-    
-    with open(os.path.join(OUTPUT_DIR, "wavcaps_captions.json"), 'w', encoding='utf-8') as f:
-        json.dump(all_captions, f, ensure_ascii=False)
+    # 5. Финальное сохранение
+    if all_embeddings:
+        print("Concatenating and saving...")
+        full_tensor = torch.cat(all_embeddings, dim=0)
         
-    print(f"✅ SUCCESS! Processed {len(all_captions)} files.")
-    print(f"Output shape: {final_tensor.shape}")
+        local_pt = LOCAL_OUTPUT_DIR / "wavcaps_embeddings.pt"
+        local_js = LOCAL_OUTPUT_DIR / "wavcaps_captions.json"
+        
+        torch.save(full_tensor, local_pt)
+        with open(local_js, 'w') as f:
+            json.dump(all_captions, f)
+            
+        # Загрузка обратно в бакет
+        upload_to_gcs(bucket, str(local_pt), f"{OUTPUT_CACHE_PREFIX}wavcaps_embeddings.pt")
+        upload_to_gcs(bucket, str(local_js), f"{OUTPUT_CACHE_PREFIX}wavcaps_captions.json")
+        
+        print("🎉 SUCCESS!")
+    else:
+        print("⚠️ No data processed.")
 
 if __name__ == "__main__":
-    cache_datasets()
+    main()
