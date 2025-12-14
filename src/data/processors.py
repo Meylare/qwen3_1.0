@@ -11,25 +11,24 @@ class QwenVideoProcessor:
     Поддерживает динамическое разрешение и нарезку на патчи.
     """
     def __init__(
-        self, 
-        model_id: str = "Qwen/Qwen3-VL-8B-Instruct", 
+        self,
+        model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
         min_pixels: int = 224 * 224,
         max_pixels: int = 512 * 512,
-        fps: float = 1.0 
+        fps: float = 1.0
     ):
-        print(f"⚙️ Инициализация QwenVideoProcessor ({model_id})...")
+        print(f"[INIT] Initializing QwenVideoProcessor ({model_id})...")
         self.max_pixels = max_pixels
         self.fps = fps
         
         try:
             self.processor = AutoProcessor.from_pretrained(
-                model_id, 
-                trust_remote_code=True,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels
+                model_id,
+                trust_remote_code=True
+                # Убираем min_pixels/max_pixels которые могут не поддерживаться
             )
         except Exception as e:
-            print(f"⚠️ Ошибка загрузки AutoProcessor: {e}")
+            print(f"[WARN] AutoProcessor loading error: {e}")
             self.processor = None
 
     def process(
@@ -85,7 +84,32 @@ class QwenVideoProcessor:
             padding=True,
             return_tensors="pt"
         )
-        
+
+        # #region agent log
+        import json
+        import time
+        import os
+        log_path = os.path.join(os.path.dirname(__file__), '..', '..', '.cursor', 'debug.log')
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'id': f'log_{int(time.time()*1000)}_processor_output',
+                'timestamp': int(time.time()*1000),
+                'location': 'src/data/processors.py:82',
+                'message': 'Processor output analysis',
+                'data': {
+                    'input_ids_shape': list(batch_inputs["input_ids"].shape),
+                    'input_ids_sample': batch_inputs["input_ids"].flatten()[:20].tolist(),
+                    'input_ids_min': int(batch_inputs["input_ids"].min()),
+                    'input_ids_max': int(batch_inputs["input_ids"].max()),
+                    'text_prompt_length': len(text_prompt),
+                    'text_prompt_sample': text_prompt[:200]
+                },
+                'sessionId': 'debug-session',
+                'runId': 'debug-run-1',
+                'hypothesisId': 'vocab_mismatch'
+            }) + '\n')
+        # #endregion
+
         # 5. Формирование результата
         result = {
             "input_ids": batch_inputs["input_ids"],
@@ -98,7 +122,7 @@ class QwenVideoProcessor:
         elif "pixel_values_videos" in batch_inputs:
             result["pixel_values"] = batch_inputs["pixel_values_videos"]
         else:
-            print(f"⚠️ WARNING: 'pixel_values' not found. Available keys: {list(batch_inputs.keys())}")
+            print(f"[WARN] 'pixel_values' not found. Available keys: {list(batch_inputs.keys())}")
         
         # Поиск Grid THW
         if "image_grid_thw" in batch_inputs:
@@ -106,6 +130,6 @@ class QwenVideoProcessor:
         elif "video_grid_thw" in batch_inputs:
             result["image_grid_thw"] = batch_inputs["video_grid_thw"]
         else:
-             print("⚠️ WARNING: 'image_grid_thw' not found.")
+             print("[WARN] 'image_grid_thw' not found.")
 
         return result
