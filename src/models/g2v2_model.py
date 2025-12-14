@@ -172,11 +172,19 @@ class G2V2Model(nn.Module):
         """Проецирует CLAP векторы в пространство Qwen."""
         if len(audio_features.shape) == 2:
             audio_features = audio_features.unsqueeze(1) # [B, 1, 512]
-            
+
         batch_size, seq_len, _ = audio_features.shape
         flat = audio_features.view(-1, audio_features.shape[-1])
         projected = self.audio_projector(flat)
         return projected.view(batch_size, seq_len, -1)
+
+    def get_audio_embeddings(self, audio_features: torch.Tensor) -> torch.Tensor:
+        """Публичный метод для получения аудио эмбеддингов (используется в Stage 1)."""
+        return self._get_audio_embeddings(audio_features)
+
+    def get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Публичный метод для получения текстовых эмбеддингов (используется в Stage 1)."""
+        return self._get_text_embeddings(input_ids)
 
     def _fuse_embeddings(
         self,
