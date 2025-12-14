@@ -1,0 +1,213 @@
+import os
+import json
+import io
+import zipfile
+from pathlib import Path
+from tqdm import tqdm
+from collections import defaultdict
+import subprocess
+import shutil
+# --- ИМПОРТЫ ДЛЯ ПАРАЛЛЕЛЬНОЙ РАБОТЫ ---
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import torch
+import torchaudio
+from laion_clap import CLAP_Module
+from google.cloud import storage
+
+# --- Конфигурация ---
+BUCKET_NAME = "slon_bucket2"
+WAVCAPS_ZIPS_PREFIX = "Qwen_dataset_stage1/raw_audio/wavcaps/zip/"
+METADATA_JSON_BLOB_NAME = "Qwen_dataset_stage1/raw_audio/wavcaps/zip/as_final.json"
+OUTPUT_CACHE_PREFIX = "data/processed/clap_cache/"
+DEVICE = "cpu"
+BATCH_SIZE = 128
+TARGET_SAMPLE_RATE = 48000
+LOCAL_TEMP_DIR = Path("/tmp/audio_processing_temp")
+LOCAL_OUTPUT_DIR = Path("/tmp/audio_processing_output")
+
+# --- Вспомогательные функции ---
+def get_gcs_client():
+    try: client = storage.Client(); print("✅ GCS клиент успешно инициализирован."); return client
+    except Exception as e: print(f"❌ Ошибка инициализации GCS клиента: {e}"); return None
+
+def upload_to_gcs(bucket, local_path, gcs_path):
+    print(f"Uploading {local_path} to gs://{bucket.name}/{gcs_path}..."); blob = bucket.blob(gcs_path); blob.upload_from_filename(local_path); print("✅ Загрузка завершена.")
+
+def download_from_gcs(bucket_name, gcs_path, local_path):
+    gs_url = f"gs://{bucket_name}/{gcs_path}"
+    Path(local_path).parent.mkdir(exist_ok=True, parents=True)
+    subprocess.run(["gcloud", "storage", "cp", gs_url, str(local_path)], check=True, capture_output=True)
+    return Path(gcs_path).name
+
+def process_audio_batch(audio_data_list, model):
+    with torch.no_grad(): embeddings = model.get_audio_embedding_from_data(x=audio_data_list, use_tensor=True); return embeddings.cpu()
+
+# --- Основная логика ---
+def main():
+    print(f"Используемое устройство: {DEVICE}")
+    LOCAL_TEMP_DIR.mkdir(exist_ok=True, parents=True)
+    LOCAL_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    
+    gcs_client = get_gcs_client()
+    if not gcs_client: return
+    bucket = gcs_client.bucket(BUCKET_NAME)
+    
+    print("Загрузка CLAP модели...")
+    clap_model = CLAP_Module(enable_fusion=False).to(DEVICE)
+    clap_model.load_ckpt()
+    clap_model.eval()
+    print("✅ Модель CLAP загружена.")
+    
+    # --- 1. СКАЧИВАНИЕ И ОБРАБОТКА МЕТАДАННЫХ ---
+    local_metadata_path = LOCAL_TEMP_DIR / "metadata.json"
+    download_from_gcs(BUCKET_NAME, METADATA_JSON_BLOB_NAME, local_metadata_path)
+    
+    print("Чтение и преобразование метаданных...")
+    metadata = {}
+    with open(local_metadata_path, 'r') as f:
+        full_data = json.load(f)
+    data_list = full_data['data']
+    
+    # !!! ВАЖНОЕ ИЗМЕНЕНИЕ: Нормализация ключей !!!
+    # Берем ID, откидываем путь и расширение. 'audio/folder/Y8372.wav' -> 'Y8372'
+    for item in data_list:
+        raw_id = item['id']
+        clean_key = Path(raw_id).stem  # .stem берет имя файла без расширения
+        metadata[clean_key] = item['caption']
+        
+    print(f"✅ Метаданные загружены. Найдено {len(metadata)} записей.")
+    # Для отладки покажем пару ключей
+    print(f"🔍 Пример ключей в метаданных: {list(metadata.keys())[:5]}")
+
+    if not metadata:
+        print("‼️ Метаданные пусты. Завершение работы."); return
+
+    # --- 2. ГРУППИРОВКА ФАЙЛОВ ---
+    print("Группировка файлов...")
+    all_blobs = list(bucket.list_blobs(prefix=WAVCAPS_ZIPS_PREFIX))
+    archive_groups = defaultdict(list)
+    for blob in all_blobs:
+        if blob.name.endswith('/'): continue
+        filename = Path(blob.name).name
+        if '.z' in filename and filename.split('.')[-1][1:].isdigit(): base_name = '.'.join(filename.split('.')[:-1])
+        elif filename.endswith('.zip'): base_name = filename[:-4]
+        else: continue
+        archive_groups[base_name].append(blob)
+    print(f"Найдено {len(archive_groups)} групп архивов: {list(archive_groups.keys())}")
+
+    all_embeddings, all_captions = [], []
+    processed_files_count, skipped_files_count = 0, 0
+    debug_missing_count = 0  # Счетчик для вывода ошибок сопоставления
+
+    main_pbar = tqdm(archive_groups.items(), desc="Обработка групп архивов")
+    for archive_name, blobs_in_group in main_pbar:
+        main_pbar.set_postfix_str(archive_name)
+        group_temp_dir = LOCAL_TEMP_DIR / archive_name
+        group_temp_dir.mkdir(exist_ok=True)
+        
+        # --- СКАЧИВАНИЕ ---
+        local_files_in_group = []
+        main_zip_file_name = None
+        tasks = []
+
+        for blob in blobs_in_group:
+            local_path = group_temp_dir / Path(blob.name).name
+            tasks.append((BUCKET_NAME, blob.name, local_path))
+            local_files_in_group.append(local_path)
+            if blob.name.endswith(".zip"): main_zip_file_name = Path(blob.name).name
+        
+        print(f"\nСкачивание {len(tasks)} частей архива параллельно...")
+        with ThreadPoolExecutor(max_workers=7) as executor:
+            futures = {executor.submit(download_from_gcs, *task): task for task in tasks}
+            for future in tqdm(as_completed(futures), total=len(tasks), desc="Скачивание частей", leave=False):
+                try: future.result()
+                except Exception as exc:
+                    print(f"❌ Ошибка при скачивании: {exc}")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+        print("✅ Скачивание завершено.")
+        
+        if not main_zip_file_name:
+            print(f"❌ Ошибка: не найден .zip файл для {archive_name}. Пропускаем."); continue
+        
+        combined_zip_path = group_temp_dir / f"{archive_name}_full.zip"
+        print(f"Починка архива: {combined_zip_path}...")
+        fix_command = ["zip", "-F", main_zip_file_name, "--out", str(combined_zip_path)]
+        subprocess.run(fix_command, check=True, cwd=group_temp_dir, capture_output=True)
+        
+        # --- ОБРАБОТКА АУДИО ---
+        try:
+            with zipfile.ZipFile(combined_zip_path, 'r') as z:
+                # Фильтруем только аудио файлы
+                audio_files_in_zip = [f for f in z.namelist() if f.lower().endswith(('.wav', '.flac', '.mp3'))]
+                batch_audio, batch_captions = [], []
+                
+                for audio_filename in tqdm(audio_files_in_zip, desc=f"Файлы в {archive_name}", leave=False):
+                    # !!! ВАЖНОЕ ИЗМЕНЕНИЕ: Нормализация имени файла из ZIP !!!
+                    # 'folder/music.flac' -> 'music'
+                    # Это позволяет найти соответствие в JSON, где тоже ключи вида 'music'
+                    clean_filename_stem = Path(audio_filename).stem
+                    
+                    caption = metadata.get(clean_filename_stem)
+                    
+                    if not caption:
+                        skipped_files_count += 1
+                        # ОТЛАДКА: Выводим первые 10 ошибок, чтобы понять причину
+                        if debug_missing_count < 10:
+                            print(f"\n⚠️ Mismatch: В ZIP файл '{audio_filename}' (ключ '{clean_filename_stem}') -> Нет в Metadata!")
+                            debug_missing_count += 1
+                        continue
+                        
+                    try:
+                        audio_bytes = z.read(audio_filename)
+                        waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
+                        if sr != TARGET_SAMPLE_RATE:
+                            waveform = torchaudio.functional.resample(waveform, sr, TARGET_SAMPLE_RATE)
+                        if waveform.shape[0] > 1:
+                            waveform = torch.mean(waveform, dim=0, keepdim=True)
+                        
+                        batch_audio.append(waveform.squeeze(0))
+                        batch_captions.append(caption)
+                    except Exception as e:
+                        # print(f"Error reading audio {audio_filename}: {e}")
+                        skipped_files_count += 1; continue
+                        
+                    if len(batch_audio) >= BATCH_SIZE:
+                        embeddings = process_audio_batch(batch_audio, clap_model)
+                        all_embeddings.extend(list(embeddings))
+                        all_captions.extend(batch_captions)
+                        processed_files_count += len(batch_audio)
+                        batch_audio, batch_captions = [], []
+                
+                # Обработка остатка
+                if batch_audio:
+                    embeddings = process_audio_batch(batch_audio, clap_model)
+                    all_embeddings.extend(list(embeddings))
+                    all_captions.extend(batch_captions)
+                    processed_files_count += len(batch_audio)
+        finally:
+            print(f"Очистка: {archive_name}")
+            shutil.rmtree(group_temp_dir)
+    
+    print("\n--- Обработка завершена ---")
+    if all_embeddings:
+        final_embeddings_tensor = torch.stack(all_embeddings)
+        print(f"Итого: обработано {processed_files_count}, пропущено {skipped_files_count}")
+        print(f"Размерность тензора: {final_embeddings_tensor.shape}")
+        
+        pt_path = LOCAL_OUTPUT_DIR / "audio_embeddings_stage1.pt"
+        json_path = LOCAL_OUTPUT_DIR / "audio_captions_stage1.json"
+        
+        torch.save(final_embeddings_tensor, pt_path)
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_captions, f, indent=2, ensure_ascii=False)
+            
+        print("✅ Загрузка результатов в GCS...")
+        upload_to_gcs(bucket, pt_path, f"{OUTPUT_CACHE_PREFIX}audio_embeddings_stage1.pt")
+        upload_to_gcs(bucket, json_path, f"{OUTPUT_CACHE_PREFIX}audio_captions_stage1.json")
+    else:
+        print(f"‼️ Не было обработано ни одного файла. Обработано: {processed_files_count}. Пропущено: {skipped_files_count}.")
+
+if __name__ == "__main__":
+    main()
