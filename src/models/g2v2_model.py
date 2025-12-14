@@ -38,13 +38,16 @@ class G2V2Model(nn.Module):
         if _test_config is not None:
             # === РЕЖИМ ТЕСТА (TINY) ===
             print("⚠️ TEST MODE: Creating random weights from config...")
+            # Используем правильный класс для VL модели
             self.model = Qwen2_5_VLForConditionalGeneration(_test_config)
+            
+            # Принудительно float32 для стабильности на CPU при тестах
             self.model.to(torch.float32)
             if hasattr(_test_config, "hidden_size"):
                 hidden_dim = _test_config.hidden_size
         else:
             # === РЕЖИМ ПРОДАКШЕНА (REAL) ===
-            print(f"🏗️ Загрузка модели {model_name}...")
+            print(f"[INFO] Загрузка модели {model_name}...")
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
@@ -56,7 +59,7 @@ class G2V2Model(nn.Module):
             if hasattr(self.model.config, "hidden_size"):
                 real_hidden_dim = self.model.config.hidden_size
                 if real_hidden_dim != hidden_dim:
-                    print(f"⚠️ Config hidden_dim ({real_hidden_dim}) != Arg ({hidden_dim}). Using Config.")
+                    print(f"[WARN] Config hidden_dim ({real_hidden_dim}) != Arg ({hidden_dim}). Using Config.")
                     hidden_dim = real_hidden_dim
         
         self.hidden_dim = hidden_dim
@@ -78,7 +81,7 @@ class G2V2Model(nn.Module):
                 num_added = self.tokenizer.add_special_tokens({'additional_special_tokens': new_tokens})
                 if num_added > 0:
                     self.model.resize_token_embeddings(len(self.tokenizer))
-                    print(f"✅ Добавлено {num_added} спец-токенов: {new_tokens}")
+                    print(f"[OK] Добавлено {num_added} спец-токенов: {new_tokens}")
         
         # 3. Заморозка Vision Encoder
         vision_module = None
@@ -90,7 +93,7 @@ class G2V2Model(nn.Module):
         if vision_module:
             for param in vision_module.parameters():
                 param.requires_grad = False
-            print("✅ Vision Encoder заморожен")
+            print("[OK] Vision Encoder заморожен")
         
         # 4. Инициализация Компонентов
         self.audio_projector = Projector(input_dim=clap_dim, hidden_dim=hidden_dim)
@@ -100,9 +103,9 @@ class G2V2Model(nn.Module):
             try:
                 state_dict = torch.load(projector_weights_path, map_location='cpu')
                 self.audio_projector.load_state_dict(state_dict)
-                print(f"✅ Проектор загружен: {projector_weights_path}")
+                print(f"[OK] Проектор загружен: {projector_weights_path}")
             except Exception as e:
-                print(f"⚠️ Ошибка загрузки проектора: {e}")
+                print(f"[WARN] Ошибка загрузки проектора: {e}")
         
         # 5. ID токенов
         if self.tokenizer:
@@ -124,7 +127,7 @@ class G2V2Model(nn.Module):
                 bias="none",
             )
             self.model = get_peft_model(self.model, lora_config)
-            print("✅ LoRA применен к модели")
+            print("[OK] LoRA применен к модели")
 
     def _get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Безопасное получение эмбеддингов текста."""
@@ -163,7 +166,6 @@ class G2V2Model(nn.Module):
             
             if visual_module:
                 with torch.no_grad():
-                    # Исправление: убираем pixel_values=pixel_values, передаем как hidden_states
                     return visual_module(hidden_states=pixel_values, grid_thw=image_grid_thw)
         
         return None
@@ -192,10 +194,11 @@ class G2V2Model(nn.Module):
         audio_embeddings: Optional[torch.Tensor] = None,
         video_embeddings: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        # Добавляем аргументы:
+        audio_attention_mask: Optional[torch.Tensor] = None, 
+        video_attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Стратегия слияния: [AUDIO] -> [VIDEO] -> [TEXT].
-        """
+        
         device = inputs_embeds.device
         batch_size = inputs_embeds.shape[0]
         
@@ -204,19 +207,32 @@ class G2V2Model(nn.Module):
         
         # 1. AUDIO
         if audio_embeddings is not None:
-            if len(audio_embeddings.shape) == 2: audio_embeddings = audio_embeddings.unsqueeze(1)
+            if len(audio_embeddings.shape) == 2: 
+                audio_embeddings = audio_embeddings.unsqueeze(1)
             parts_embeds.append(audio_embeddings)
-            parts_masks.append(torch.ones((batch_size, audio_embeddings.shape[1]), dtype=torch.long, device=device))
+            
+            # ИСПОЛЬЗУЕМ ПЕРЕДАННУЮ МАСКУ
+            if audio_attention_mask is not None:
+                parts_masks.append(audio_attention_mask.to(device=device, dtype=torch.long))
+            else:
+                parts_masks.append(torch.ones((batch_size, audio_embeddings.shape[1]), dtype=torch.long, device=device))
             
         # 2. VIDEO
         if video_embeddings is not None:
             parts_embeds.append(video_embeddings)
-            parts_masks.append(torch.ones((batch_size, video_embeddings.shape[1]), dtype=torch.long, device=device))
+            
+            # ИСПОЛЬЗУЕМ ПЕРЕДАННУЮ МАСКУ
+            if video_attention_mask is not None:
+                parts_masks.append(video_attention_mask.to(device=device, dtype=torch.long))
+            else:
+                parts_masks.append(torch.ones((batch_size, video_embeddings.shape[1]), dtype=torch.long, device=device))
             
         # 3. TEXT
         parts_embeds.append(inputs_embeds)
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, inputs_embeds.shape[1]), dtype=torch.long, device=device)
+        else:
+            attention_mask = attention_mask.to(device=device, dtype=torch.long)
         parts_masks.append(attention_mask)
         
         # Склейка
@@ -233,6 +249,9 @@ class G2V2Model(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         video_features: Optional[torch.Tensor] = None,
         audio_features: Optional[torch.Tensor] = None,
+        # Добавляем маски в аргументы
+        audio_attention_mask: Optional[torch.Tensor] = None,
+        video_attention_mask: Optional[torch.Tensor] = None,
         task_type: str = "score",
         **kwargs
     ) -> Union[torch.Tensor, Any]:
@@ -250,12 +269,14 @@ class G2V2Model(nn.Module):
         if audio_features is not None:
             audio_embeds = self._get_audio_embeddings(audio_features)
             
-        # 4. Fusion
+        # 4. Fusion (Передаем маски)
         inputs_embeds, final_mask = self._fuse_embeddings(
             inputs_embeds=text_embeds,
             audio_embeddings=audio_embeds,
             video_embeddings=video_embeds,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            audio_attention_mask=audio_attention_mask,
+            video_attention_mask=video_attention_mask
         )
         
         # 5. Backbone Pass
@@ -272,9 +293,24 @@ class G2V2Model(nn.Module):
         else:
             last_hidden = outputs[0]
         
-        seq_lengths = final_mask.sum(dim=1) - 1
+        # --- FIX: ROBUST LAST TOKEN POOLING ---
+        # Вместо суммирования маски (что ломается при паддинге внутри),
+        # используем argmax по индексам, умноженным на маску.
+        
+        # Создаем тензор индексов [0, 1, ..., seq_len-1]
+        indices = torch.arange(last_hidden.shape[1], device=last_hidden.device)
+        
+        # Умножаем индексы на маску. Там где padding (0), будет 0.
+        # Broadcasting: [SeqLen] * [Batch, SeqLen] -> [Batch, SeqLen]
+        masked_indices = indices * final_mask
+        
+        # Находим индекс максимального элемента в каждой строке.
+        # Так как индексы монотонно возрастают, максимум будет у последнего ненулевого элемента маски.
+        last_token_indices = masked_indices.argmax(dim=1)
+        
         batch_indices = torch.arange(last_hidden.shape[0], device=last_hidden.device)
-        pooled_output = last_hidden[batch_indices, seq_lengths]
+        pooled_output = last_hidden[batch_indices, last_token_indices]
+        # -------------------------------------
         
         # 7. Выход
         if task_type == "score":

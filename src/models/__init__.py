@@ -11,7 +11,7 @@ from .components import (
     MLPAdapter,      # Алиас для Projector
 )
 
-from .g2v2_model import (
+from .G2V2_model import (
     G2V2Model,
 )
 
