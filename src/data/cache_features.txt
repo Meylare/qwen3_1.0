@@ -1,0 +1,301 @@
+1 ячейка
+
+!pip install --no-cache-dir \
+    "git+https://github.com/huggingface/transformers.git" \
+    "accelerate>=0.26.0" \
+    "decord" \
+    "qwen-vl-utils" \
+    "smart_open[gcs]" \
+    "librosa" \
+    "soundfile" \
+    "pandas" \
+    "numpy" \
+    "pyarrow"
+
+2 ячейка
+
+!pip install ninja packaging
+
+# 2. Устанавливаем Flash Attention 2 из релиза (под Torch 2.4.x и CUDA 12.x, стандарт Kaggle)
+!pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+
+
+3 ячейка
+
+import os
+import io
+import shutil
+import torch
+import pandas as pd
+import numpy as np
+import librosa
+import cv2
+from PIL import Image
+from tqdm.auto import tqdm
+from decord import VideoReader, cpu
+from transformers import AutoProcessor, AutoModelForImageTextToText, ClapModel, ClapProcessor
+from kaggle_secrets import UserSecretsClient
+import smart_open
+import gc
+
+# --- ⚙️ КОНФИГ ---
+CONFIG = {
+    # Пути
+    "parquet_path": "/kaggle/input/dataset-v0/dataset_v0_complete.parquet",
+    "parquet_id_column": "video_id",
+    "gcp_bucket_name": "slon_bucket2",
+    "gcp_video_folder": "100k_videos",
+    "gcp_audio_folder": "audio_wav_16kHz",
+    "gcp_output_folder": "data/processed/stage2_cache", # Папка для тензоров Stage 2
+    
+    # Модели
+    "qwen_model_id": "Qwen/Qwen3-VL-8B-Instruct",  # 👈 ВАША МОДЕЛЬ
+    "clap_model_id": "laion/clap-htsat-unfused",
+    
+    # Параметры обработки
+    "num_frames": 10,       # Количество кадров и аудио-чанков
+    "audio_sr": 48000,      # Родная частота CLAP
+    "min_pixels": 224 * 224,
+    "max_pixels": 512 * 512, # Ограничение разрешения (как просили)
+    
+    # Железо
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "dtype": torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+}
+
+# --- 🔐 GCS AUTH ---
+try:
+    user_secrets = UserSecretsClient()
+    gcs_credentials = user_secrets.get_secret("GCS_KEY_JSON")
+    with open("/kaggle/working/gcs_sa_key.json", "w") as f: f.write(gcs_credentials)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/kaggle/working/gcs_sa_key.json"
+    print("🔑 GCS Auth Success.")
+except Exception as e:
+    print(f"⚠️ GCS Auth Warning: {e}")
+
+class FeatureCacher:
+    def __init__(self):
+        print(f"🔧 Init on {CONFIG['device']} ({CONFIG['dtype']})...")
+        
+        # --- 1. Qwen3 Vision (УМНАЯ ЗАГРУЗКА) ---
+        print(f"👁️ Loading Qwen3 Vision: {CONFIG['qwen_model_id']}...")
+        
+        self.qwen_processor = AutoProcessor.from_pretrained(
+            CONFIG["qwen_model_id"], 
+            min_pixels=CONFIG["min_pixels"],
+            max_pixels=CONFIG["max_pixels"]
+        )
+        
+        # ШАГ 1: Грузим всю модель в CPU (RAM)
+        print("   -> Loading full model to CPU RAM...")
+        full_model = AutoModelForImageTextToText.from_pretrained(
+            CONFIG["qwen_model_id"], 
+            torch_dtype=CONFIG["dtype"],
+            device_map="cpu",  # В RAM
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa"
+        )
+        
+        # ШАГ 2: Достаем энкодер (ИСПРАВЛЕННЫЙ ПУТЬ)
+        print("   -> Extracting Visual Encoder to GPU...")
+        
+        # ⚠️ ФИКС: У Qwen3VLForConditionalGeneration энкодер лежит внутри .model
+        if hasattr(full_model, "visual"):
+            self.visual = full_model.visual.to(CONFIG["device"])
+        else:
+            self.visual = full_model.model.visual.to(CONFIG["device"])
+            
+        # ШАГ 3: Очистка памяти
+        # Обнуляем ссылку в старой модели, чтобы GC мог удалить остальное
+        if hasattr(full_model, "visual"):
+            full_model.visual = None
+        else:
+            full_model.model.visual = None
+            
+        del full_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Заморозка
+        self.visual.eval()
+        self.visual.requires_grad_(False)
+        
+        print(f"   ✅ Visual Encoder loaded. VRAM used: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+        # --- 2. CLAP Audio ---
+        print(f"👂 Loading CLAP: {CONFIG['clap_model_id']}...")
+        self.clap_model = ClapModel.from_pretrained(CONFIG["clap_model_id"]).to(CONFIG["device"])
+        self.clap_processor = ClapProcessor.from_pretrained(CONFIG["clap_model_id"])
+        self.clap_model.eval()
+        self.clap_model.requires_grad_(False)
+
+    
+    def process_video_qwen3(self, video_path):
+        try:
+            # 1. Чтение видео
+            vr = VideoReader(video_path, ctx=cpu(0))
+            total_frames = len(vr)
+            if total_frames < 1: return None
+            
+            # 2. Сэмплинг 10 кадров
+            indices = np.linspace(0, total_frames - 1, CONFIG["num_frames"]).astype(int)
+            frames_arr = vr.get_batch(indices).asnumpy()
+            frames_pil = [Image.fromarray(f) for f in frames_arr]
+            
+            # 3. Подготовка инпутов (с заглушкой текста)
+            dummy_text = ["<|image_pad|>"] * len(frames_pil)
+            inputs = self.qwen_processor(text=dummy_text, images=frames_pil, padding=True, return_tensors="pt")
+            
+            # 4. Поиск grid_thw
+            grid_thw = None
+            if "image_grid_thw" in inputs:
+                grid_thw = inputs["image_grid_thw"]
+            elif "grid_thw" in inputs:
+                grid_thw = inputs["grid_thw"]
+            
+            if grid_thw is None:
+                print(f"⚠️ Warning: grid_thw missing. Keys: {inputs.keys()}")
+                return None
+
+            # 5. Перенос на GPU
+            pixel_values = inputs["pixel_values"].to(self.visual.device).to(CONFIG['dtype'])
+            grid_thw = grid_thw.to(self.visual.device).long()
+            
+            # 6. Инференс
+            with torch.no_grad():
+                visual_features = self.visual(pixel_values, grid_thw=grid_thw)
+            
+            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+            # Если вернулся tuple (тензор, ...), берем первый элемент
+            if isinstance(visual_features, tuple):
+                visual_features = visual_features[0]
+            
+            # Возврат [N, Dim] в float32
+            return visual_features.cpu().to(torch.float32)
+            
+        except Exception as e:
+            print(f"❌ Video Error ({os.path.basename(video_path)}): {e}")
+            return None
+    
+    def process_audio_sliced(self, audio_path):
+        """
+        Режет аудио на 10 частей (по времени), прогоняет через CLAP.
+        Возвращает: [10, 512]
+        """
+        try:
+            # 1. Загрузка
+            wav, sr = librosa.load(audio_path, sr=CONFIG["audio_sr"]) # 48kHz
+            
+            if len(wav) < 1000: # Пустой файл
+                wav = np.zeros(int(CONFIG["audio_sr"] * 1.0)) # 1 секунда тишины
+                
+            # 2. Нарезка на 10 частей
+            # Используем array_split для гарантированного разделения на N частей
+            chunks = np.array_split(wav, CONFIG["num_frames"])
+            
+            embeddings = []
+            
+            # 3. Инференс чанков
+            for chunk in chunks:
+                # Паддинг если чанк слишком короткий (CLAP не любит <0.1 сек)
+                if len(chunk) < 1000:
+                    chunk = np.pad(chunk, (0, 1000 - len(chunk)))
+                    
+                inputs = self.clap_processor(
+                    audio=chunk, 
+                    sampling_rate=CONFIG["audio_sr"], 
+                    return_tensors="pt", 
+                    padding=True
+                )
+                inputs = {k: v.to(CONFIG["device"]) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    # [1, 512]
+                    emb = self.clap_model.get_audio_features(**inputs)
+                embeddings.append(emb.cpu())
+            
+            # 4. Сборка [10, 512]
+            return torch.cat(embeddings, dim=0)
+
+        except Exception as e:
+            print(f"❌ Audio Error ({os.path.basename(audio_path)}): {e}")
+            return None
+
+def main():
+    if not os.path.exists(CONFIG["parquet_path"]):
+        print("⚠️ Parquet not found."); return
+
+    df = pd.read_parquet(CONFIG["parquet_path"])
+    # df = df.head(5) # 🧪 Тестовый режим (раскомментировать для теста)
+
+    cacher = FeatureCacher()
+    
+    results = []
+    base_output = f"gs://{CONFIG['gcp_bucket_name']}/{CONFIG['gcp_output_folder']}"
+    
+    print(f"🚀 Processing {len(df)} files using Qwen3-VL & CLAP...")
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        vid_id = row[CONFIG["parquet_id_column"]]
+        
+        # Пути GCS
+        gcs_vid = f"gs://{CONFIG['gcp_bucket_name']}/{CONFIG['gcp_video_folder']}/{vid_id}.mp4"
+        gcs_aud = f"gs://{CONFIG['gcp_bucket_name']}/{CONFIG['gcp_audio_folder']}/{vid_id}.wav"
+        
+        # Локальные временные пути
+        loc_vid = f"/kaggle/working/{vid_id}.mp4"
+        loc_aud = f"/kaggle/working/{vid_id}.wav"
+        
+        try:
+            # Скачивание
+            with smart_open.open(gcs_vid, "rb") as fin, open(loc_vid, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            with smart_open.open(gcs_aud, "rb") as fin, open(loc_aud, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            
+            # Обработка
+            v_tensor = cacher.process_video_qwen3(loc_vid)
+            a_tensor = cacher.process_audio_sliced(loc_aud)
+            
+            if v_tensor is not None and a_tensor is not None:
+                # Пути сохранения тензоров
+                v_out_key = f"{CONFIG['gcp_output_folder']}/video_tensors/{vid_id}.pt"
+                a_out_key = f"{CONFIG['gcp_output_folder']}/audio_tensors/{vid_id}.pt"
+                v_out_full = f"gs://{CONFIG['gcp_bucket_name']}/{v_out_key}"
+                a_out_full = f"gs://{CONFIG['gcp_bucket_name']}/{a_out_key}"
+                
+                # Загрузка тензоров в GCS (через буфер, без записи на диск)
+                with io.BytesIO() as buf:
+                    torch.save(v_tensor, buf)
+                    buf.seek(0)
+                    with smart_open.open(v_out_full, "wb") as f: f.write(buf.read())
+                    
+                with io.BytesIO() as buf:
+                    torch.save(a_tensor, buf)
+                    buf.seek(0)
+                    with smart_open.open(a_out_full, "wb") as f: f.write(buf.read())
+                
+                # Обновление записи
+                new_row = row.to_dict()
+                new_row["video_tensor_path"] = v_out_full
+                new_row["audio_tensor_path"] = a_out_full
+                results.append(new_row)
+                
+        except Exception as e:
+            # print(f"Processing failed for {vid_id}: {e}") # Debug
+            pass
+        finally:
+            if os.path.exists(loc_vid): os.remove(loc_vid)
+            if os.path.exists(loc_aud): os.remove(loc_aud)
+
+    # Финальный отчет
+    if results:
+        final_parquet_path = f"{base_output}/train_stage2_cached.parquet"
+        print(f"💾 Saving registry to {final_parquet_path}...")
+        pd.DataFrame(results).to_parquet(final_parquet_path, engine="pyarrow")
+        print("✅ Done!")
+    else:
+        print("⚠️ No results generated.")
+
+if __name__ == "__main__":
+    main()
