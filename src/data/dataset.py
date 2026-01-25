@@ -59,13 +59,26 @@ class ViralVideoDataset(Dataset):
 
         label = torch.tensor(item['targets']['viral_index'], dtype=torch.float)
 
-        return {
+        # Используем видео-ключи для Qwen2.5-Omni (важно для временной шкалы)
+        result = {
             "input_ids": inputs["input_ids"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
-            "pixel_values": inputs["pixel_values"].squeeze(0),
-            "image_grid_thw": inputs.get("image_grid_thw").squeeze(0) if "image_grid_thw" in inputs else None,
             "labels": label
         }
+        
+        # Приоритет: pixel_values_videos > pixel_values
+        if "pixel_values_videos" in inputs:
+            result["pixel_values_videos"] = inputs["pixel_values_videos"].squeeze(0)
+        elif "pixel_values" in inputs:
+            result["pixel_values_videos"] = inputs["pixel_values"].squeeze(0)
+        
+        # Приоритет: video_grid_thw > image_grid_thw
+        if "video_grid_thw" in inputs:
+            result["video_grid_thw"] = inputs["video_grid_thw"].squeeze(0)
+        elif "image_grid_thw" in inputs:
+            result["video_grid_thw"] = inputs["image_grid_thw"].squeeze(0)
+        
+        return result
 
     def _load_video(self, path):
         if not os.path.exists(path):
