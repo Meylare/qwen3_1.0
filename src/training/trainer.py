@@ -11,7 +11,7 @@ from src.models.viral_model import ViralPredictorModel
 
 # --- КОНФИГ ---
 JSONL_PATH = "data/processed/train.jsonl"
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+MODEL_ID = "Qwen2.5-Omni-7B"
 BATCH_SIZE = 1
 GRAD_ACCUMULATION_STEPS = 8
 LR = 2e-4

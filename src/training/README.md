@@ -4,7 +4,7 @@
 
 ## Что делает скрипт
 
-1. **Загружает G2V2Model** с Qwen-3-VL
+1. **Загружает G2V2Model** с Qwen2.5-Omni-7B
 2. **Замораживает всю модель** кроме `audio_projector`
 3. **Обучает проектор** на генерацию текстовых описаний аудио
 4. **Сохраняет** только веса проектора в `projector.bin`
@@ -18,7 +18,7 @@ conda activate qwen3-project
 python src/training/train_stage1.py \
     --embeddings_file data/wavcaps_embeddings.pt \
     --captions_file data/wavcaps_captions.json \
-    --model_name Qwen/Qwen3-VL-8B-Instruct \
+    --model_name Qwen2.5-Omni-7B \
     --batch_size 4 \
     --num_epochs 3 \
     --learning_rate 1e-4 \

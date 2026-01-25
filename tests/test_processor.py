@@ -12,7 +12,7 @@ class TestQwenProcessor(unittest.TestCase):
     
     def setUp(self):
         print("\n[Setup] Loading Processor...")
-        self.model_id = "Qwen/Qwen3-VL-8B-Instruct"
+        self.model_id = "Qwen2.5-Omni-7B"
         try:
             self.processor = QwenVideoProcessor(model_id=self.model_id, min_pixels=256*256, max_pixels=512*512)
         except Exception as e:
@@ -50,7 +50,7 @@ class TestQwenProcessor(unittest.TestCase):
         print("[Test] Running Pixel Limit Logic...")
         huge_frame = Image.new('RGB', (1000, 1000), color='blue')
         
-        # Подаем 2 одинаковых кадра, чтобы это считалось валидным "видео" для Qwen3
+        # Подаем 2 одинаковых кадра, чтобы это считалось валидным "видео" для Qwen2.5-Omni-7B
         inputs = self.processor.process("Big image", [huge_frame, huge_frame])
         
         self.assertIn('pixel_values', inputs)

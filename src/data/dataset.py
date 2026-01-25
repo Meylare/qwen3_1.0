@@ -8,7 +8,7 @@ import numpy as np
 
 
 class ViralVideoDataset(Dataset):
-    def __init__(self, jsonl_path, processor_path="Qwen/Qwen2.5-VL-7B-Instruct", max_frames=10):
+    def __init__(self, jsonl_path, processor_path="Qwen2.5-Omni-7B", max_frames=10):
         self.data = []
         with open(jsonl_path, 'r') as f:
             for line in f:

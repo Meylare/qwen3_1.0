@@ -1,13 +1,13 @@
-# Qwen3-VL Video Virality Prediction System
+# Qwen2.5-Omni-7B Video Virality Prediction System
 
-Система для предсказания вирусности видео на основе мультимодального анализа с использованием Qwen3-VL и XGBoost.
+Система для предсказания вирусности видео на основе мультимодального анализа с использованием Qwen2.5-Omni-7B и XGBoost.
 
 ## 🏗️ Архитектура
 
 Проект состоит из двух основных компонентов:
 
 ### 🤖 Нейронная сеть G2V2 (Grok Video Virality)
-- **Модель:** Qwen3-VL-8B-Instruct с LoRA адаптацией
+- **Модель:** Qwen2.5-Omni-7B с LoRA адаптацией
 - **Вход:** Видео, аудио, текст описания
 - **Выход:** Оценка вирусности 
 
@@ -98,7 +98,7 @@ python -m pytest tests/ -v
 ```
 Input: Video + Text + Audio
        ↓
-Qwen3-VL-8B (заморожен) → Vision Encoder
+Qwen2.5-Omni-7B (заморожен) → Vision Encoder
        ↓
 Audio Projector (512→4096) → CLAP embeddings
        ↓
@@ -111,7 +111,7 @@ Predictor Head → Viral Index (0-1)
 
 ### Ключевые компоненты
 
-- **QwenVideoProcessor:** Подготовка видео для Qwen3-VL
+- **QwenVideoProcessor:** Подготовка видео для Qwen2.5-Omni-7B
 - **Projector:** MLP адаптер для CLAP эмбеддингов
 - **PredictorHead:** Регрессионная голова для предсказания
 - **RMSNorm:** Нормализация по Qwen стандартам

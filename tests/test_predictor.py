@@ -12,7 +12,7 @@ def test_viral_predictor():
 
     # 1. Настройка окружения
     BATCH_SIZE = 8
-    HIDDEN_DIM = 4096 # Размерность Qwen 3 (или другой большой LLM)
+    HIDDEN_DIM = 4096 # Размерность Qwen2.5-Omni-7B (или другой большой LLM)
     model = ViralPredictor(hidden_dim=HIDDEN_DIM)
     
     print(f"   ⚙️ Config: Batch={BATCH_SIZE}, Hidden={HIDDEN_DIM}")
