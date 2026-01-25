@@ -1,135 +1,248 @@
-"""
-ETL скрипт подготовки данных для Viral Index.
-Извлекает данные из train_stage2.parquet, формирует system_prompt,
-создает таргеты с логарифмической формулой и готовит XGBoost матрицу.
-"""
-
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Dict, Any, List, Tuple
-
 import json
-import numpy as np
+import os
 import pandas as pd
-import xgboost as xgb
+from datetime import datetime
 
+# --- КОНФИГУРАЦИЯ ФАЙЛОВ ---
+# Укажите корректные пути к вашим файлам
 
-INPUT_PARQUET_PATH = Path(__file__).resolve().parents[2] / "train_stage2.parquet"
-OUTPUT_JSONL_PATH = "TODO_OUTPUT_JSONL_PATH.jsonl"
-VIDEO_ROOT_DIR = "TODO_SERVER_VIDEO_PATH"
+# Исходные данные
+VIDEOS_FILE = '100k.jsonl'     # Файл с видео
+PROFILES_FILE = 'owners.jsonl'    # Файл с профилями (или jsonl_2.jsonl)
 
+# Файлы с метриками (Viral Index), разделенные на Train и Val
+TRAIN_PARQUET = 'train_stage2.parquet' 
+VAL_PARQUET = 'val_stage2.parquet'
 
-def _get_text_value(value: Any) -> str:
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return ""
-    return str(value).strip()
+# Куда сохранять готовые датасеты
+OUTPUT_TRAIN = 'dataset_train.jsonl'
+OUTPUT_VAL = 'dataset_val.jsonl'
 
+# Дни недели на русском
+DAYS_RU = {
+    'Monday': 'Понедельник', 'Tuesday': 'Вторник', 'Wednesday': 'Среда',
+    'Thursday': 'Четверг', 'Friday': 'Пятница', 'Saturday': 'Суббота',
+    'Sunday': 'Воскресенье'
+}
 
-def build_system_prompt(row: pd.Series) -> str:
-    author = _get_text_value(row.get("author"))
-    bio = _get_text_value(row.get("bio"))
-    description = _get_text_value(row.get("description"))
-    music = _get_text_value(row.get("music"))
-    upload_date = _get_text_value(row.get("upload_date"))
+def load_profiles_db(filepath):
+    """
+    Загружает профили в память.
+    Returns: dict {username: full_profile_data}
+    """
+    print(f"📂 Загрузка профилей из {filepath}...")
+    profiles = {}
+    if not os.path.exists(filepath):
+        print("⚠️ Файл профилей не найден! Данные профиля будут пустыми.")
+        return profiles
+        
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                if 'username' in data:
+                    profiles[data['username']] = data
+            except:
+                continue
+    return profiles
 
-    parts = [
-        f"author: {author}",
-        f"bio: {bio}",
-        f"description: {description}",
-        f"music: {music}",
-        f"date: {upload_date}",
-    ]
-    return " | ".join(parts)
+def load_targets_from_parquet(filepath):
+    """
+    Читает Parquet файл и возвращает словарь метрик.
+    Ключ: video_id (он же shortCode)
+    Значение: {viral_index, baseline_views}
+    """
+    if not os.path.exists(filepath):
+        print(f"⚠️ Файл {filepath} не найден. Пропускаем.")
+        return {}
 
-
-def _parse_context_features(df: pd.DataFrame) -> pd.DataFrame:
-    if "context_str" not in df.columns:
-        return pd.DataFrame(index=df.index)
-
-    def _safe_load(payload: Any) -> Dict[str, Any]:
-        if not isinstance(payload, str) or not payload.strip():
-            return {}
-        try:
-            return json.loads(payload)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-
-    context_series = df["context_str"].map(_safe_load)
-    context_df = pd.json_normalize(context_series)
-    context_df.index = df.index
-    return context_df
-
-
-def _add_log_target(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-    if target_col not in df.columns:
-        raise ValueError(f"Missing required target column: {target_col}")
-
-    values = pd.to_numeric(df[target_col], errors="coerce").fillna(0)
-    # Логарифмическая формула: log1p с защитой от отрицательных значений.
-    df[f"{target_col}_log"] = np.log1p(values.clip(lower=0))
-    return df
-
-
-def _build_xgb_matrix(df: pd.DataFrame, target_col: str) -> Tuple[xgb.DMatrix, List[str]]:
-    context_df = _parse_context_features(df)
-    numeric_cols = [
-        col
-        for col in df.select_dtypes(include=["number"]).columns
-        if col not in {target_col, f"{target_col}_log"}
-    ]
-    feature_df = pd.concat([context_df, df[numeric_cols]], axis=1)
-    if feature_df.empty:
-        feature_df = pd.DataFrame({"bias": np.ones(len(df))}, index=df.index)
-
-    dmatrix = xgb.DMatrix(feature_df, label=df[target_col])
-    return dmatrix, feature_df.columns.tolist()
-
-
-def _build_jsonl_records(
-    df: pd.DataFrame,
-    video_root_dir: str
-) -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
+    print(f"📊 Чтение метрик из {filepath}...")
+    # Читаем только нужные колонки для экономии памяти
+    df = pd.read_parquet(filepath, columns=['video_id', 'viral_index', 'context_str'])
+    
+    targets = {}
     for _, row in df.iterrows():
-        video_id = _get_text_value(row.get("video_id"))
-        record = {
-            "video_id": video_id,
-            "system_prompt": row.get("system_prompt", ""),
-            "viral_index": row.get("viral_index"),
-            "viral_index_log": row.get("viral_index_log"),
-            "video_path": f"{video_root_dir}/{video_id}",
+        vid = str(row['video_id'])
+        v_index = row['viral_index']
+        ctx_str = row['context_str']
+        
+        # Достаем baseline из context_str
+        baseline = 0.0
+        try:
+            if ctx_str:
+                ctx_json = json.loads(ctx_str)
+                baseline = float(ctx_json.get('expected_views', 0.0))
+        except:
+            baseline = 0.0
+            
+        targets[vid] = {
+            'viral_index': v_index,
+            'baseline_views': baseline
         }
-        records.append(record)
-    return records
+    
+    print(f"   -> Загружено {len(targets)} записей.")
+    return targets
 
+def format_timestamp_ru(ts_str):
+    """Преобразует ISO дату в формат: Пятница, 18:00"""
+    try:
+        if not ts_str: return "Неизвестно"
+        clean_ts = ts_str.split('.')[0].replace('Z', '')
+        dt = datetime.fromisoformat(clean_ts)
+        
+        day_eng = dt.strftime('%A')
+        day_ru = DAYS_RU.get(day_eng, day_eng)
+        time_str = dt.strftime('%H:%M')
+        
+        return f"{day_ru}, {time_str}"
+    except:
+        return str(ts_str)
 
-def run_etl(
-    input_parquet: Path = INPUT_PARQUET_PATH,
-    output_jsonl: str = OUTPUT_JSONL_PATH,
-    video_root_dir: str = VIDEO_ROOT_DIR
-) -> None:
-    df = pd.read_parquet(input_parquet)
-    if "viral_index" not in df.columns:
-        raise ValueError("Viral index column not found in input data.")
+def process_etl():
+    # 1. Загружаем справочники
+    profiles_db = load_profiles_db(PROFILES_FILE)
+    train_targets_db = load_targets_from_parquet(TRAIN_PARQUET)
+    val_targets_db = load_targets_from_parquet(VAL_PARQUET)
+    
+    print("-" * 50)
+    print("🚀 Начинаем обработку видео и генерацию JSONL...")
+    
+    count_train = 0
+    count_val = 0
+    count_skipped = 0
+    
+    # Множество для защиты от дубликатов
+    processed_ids = set()
+    
+    with open(VIDEOS_FILE, 'r', encoding='utf-8') as f_in, \
+         open(OUTPUT_TRAIN, 'w', encoding='utf-8') as f_train, \
+         open(OUTPUT_VAL, 'w', encoding='utf-8') as f_val:
+        
+        for line in f_in:
+            try:
+                vid = json.loads(line)
+            except:
+                continue
+                
+            short_code = vid.get('shortCode')
+            if not short_code:
+                continue
 
-    df = df.copy()
-    df["system_prompt"] = df.apply(build_system_prompt, axis=1)
-    df = _add_log_target(df, "viral_index")
+            # --- ПРОВЕРКА НА ДУБЛИКАТЫ ---
+            if short_code in processed_ids:
+                # Мы уже обработали это видео ранее -> пропускаем
+                continue
+            
+            # Добавляем ID в список обработанных
+            processed_ids.add(short_code)
 
-    _dmatrix, feature_cols = _build_xgb_matrix(df, "viral_index")
-    print(f"[INFO] XGBoost features prepared: {len(feature_cols)} columns.")
+            # --- ОПРЕДЕЛЕНИЕ: КУДА ПИСАТЬ? ---
+            target_info = None
+            writer = None
+            
+            if short_code in train_targets_db:
+                target_info = train_targets_db[short_code]
+                writer = f_train
+                count_train += 1
+            elif short_code in val_targets_db:
+                target_info = val_targets_db[short_code]
+                writer = f_val
+                count_val += 1
+            else:
+                # Видео нет ни в трейне, ни в валидации
+                count_skipped += 1
+                continue
 
-    records = _build_jsonl_records(df, video_root_dir)
-    output_path = Path(output_jsonl)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+            # --- СБОР ДАННЫХ ДЛЯ PROMPT ---
+            
+            username = vid.get('ownerUsername', '')
+            prof = profiles_db.get(username, {})
+            
+            # 1. Никнейм
+            nickname = username
+            
+            # 2. Био
+            bio = prof.get('biography', '').replace('\n', ' ').strip()
+            if not bio: bio = "Нет описания"
+            
+            # 3. Статус
+            is_verified = prof.get('verified', False)
+            ver_status = "Verified" if is_verified else "Not verified"
+            
+            # 4. Описание
+            caption = vid.get('caption', '').replace('\n', ' ').strip()
+            
+            # 5. Отметки
+            tags = vid.get('hashtags', []) + vid.get('mentions', [])
+            tags_str = ", ".join(tags) if tags else "Нет"
+            
+            # 6. Локация
+            loc_data = vid.get('location')
+            location = loc_data.get('name', 'Не указана') if loc_data else 'Не указана'
+            
+            # 7. Музыка
+            m_info = vid.get('musicInfo', {})
+            music_str = f"{m_info.get('artist_name','')} - {m_info.get('song_name','')}"
+            if music_str.strip() == "-": music_str = "Оригинальный звук"
+            
+            # 8. Таймстамп
+            ts_str = format_timestamp_ru(vid.get('timestamp'))
+            
+            # 9. Длительность (Спец. логика + защита от None)
+            raw_duration = vid.get('videoDuration')
+            
+            if raw_duration is None:
+                duration = 10.0
+            else:
+                try:
+                    d_val = float(raw_duration)
+                    if d_val >= 10.0:
+                        duration = 10.0
+                    else:
+                        duration = round(d_val, 1)
+                except (ValueError, TypeError):
+                    duration = 10.0
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # --- ФОРМИРОВАНИЕ SYSTEM PROMPT ---
+            system_prompt = (
+                f"Никнейм: {nickname}. "
+                f"Био: {bio}. "
+                f"Статус веревекации: {ver_status}. "
+                f"Описание: {caption}. "
+                f"Отметки: {tags_str}. "
+                f"Локация: {location}. "
+                f"Инфо по музыке: {music_str}. "
+                f"Таймстамп: {ts_str}. "
+                f"Длительность видео: {duration} сек."
+            )
 
-    print(f"[INFO] JSONL saved to {output_path}")
+            # --- Target Values ---
+            # Безопасное получение просмотров
+            views_val = vid.get('videoPlayCount')
+            real_views = float(views_val) if views_val is not None else 0.0
 
+            # --- СБОРКА ОБЪЕКТА ---
+            output_obj = {
+                "id": short_code,
+                "video_path": f"/mnt/disks/fast_data/videos/{short_code}.mp4",
+                
+                "system_prompt": system_prompt,
+                "aux_caption": caption,
+                
+                "targets": {
+                    "viral_index": target_info['viral_index'],
+                    "baseline_views": target_info['baseline_views'],
+                    "real_views": real_views
+                }
+            }
+            
+            writer.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
+
+    print("-" * 50)
+    print("✅ Готово.")
+    print(f"Записано в TRAIN: {count_train} -> {OUTPUT_TRAIN}")
+    print(f"Записано в VAL:   {count_val} -> {OUTPUT_VAL}")
+    print(f"Пропущено (нет в parquet или дубликаты): {count_skipped}")
 
 if __name__ == "__main__":
-    run_etl()
+    process_etl()
