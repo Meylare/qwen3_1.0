@@ -142,13 +142,19 @@ python -m pytest tests/ -v
 ## 📁 Структура проекта
 
 ```
+├── configs/                       # Конфиги (пока пусто)
+├── scripts/                       # Вспомогательные скрипты (пока пусто)
 ├── src/
 │   ├── data/
-│   │   └── processors.py          # QwenVideoProcessor
+│   │   ├── __init__.py
+│   │   ├── datasets.py
+│   │   └── etl.py
+│   ├── inference/
+│   │   ├── __init__.py
+│   │   └── optimizer.py
 │   ├── models/
-│   │   ├── __init__.py           # Экспорты компонентов
-│   │   ├── components.py          # RMSNorm, Projector, PredictorHead
-│   │   └── g2v2_model.py          # G2V2Model с LoRA
+│   │   ├── __init__.py
+│   │   └── g2v2_model.py
 │   └── baseline/                  # XGBoost пайплайн
 │       ├── ingestion.py           # Загрузка данных
 │       ├── feature_engineering.py # Создание признаков
@@ -157,6 +163,11 @@ python -m pytest tests/ -v
 │       ├── generate_viral_index.py # Генерация таргетов
 │       └── statistic/
 │           └── features_lib.py    # Статические признаки
+│   └── training/
+│       ├── __init__.py
+│       ├── README.md
+│       ├── train_stage2.py
+│       └── train_stage3.py
 ├── tests/                         # Модульные тесты
 ├── data_analyze/                  # Анализ данных
 └── work_data/                     # Рабочие скрипты
