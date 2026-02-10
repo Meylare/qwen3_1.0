@@ -11,3 +11,11 @@ venv/
 
 *jsonl
 *.parquet
+*.csv
+*.joblib
+*.json
+temp_processing/
+*.mp4
+*.wav
+check_text.py
+merge_viralindex_whisper.py
