@@ -177,7 +177,8 @@ python -m pytest tests/ -v
 
 ### Требования к окружению
 - Python 3.10+
-- CUDA 11.8+ (для GPU)
+- CUDA 11.8+ (для GPU на Linux/Windows)
+- MPS (Metal Performance Shaders) для macOS с Apple Silicon
 - 16GB+ RAM
 - 100GB+ диск (для моделей)
 
