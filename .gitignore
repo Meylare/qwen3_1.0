@@ -19,10 +19,3 @@ temp_processing/
 *.wav
 check_text.py
 merge_viralindex_whisper.py
-
-# Visualization outputs
-visualizations/
-*.png
-*.jpg
-*.jpeg
-!**/test_output/*.png  # Keep test outputs for reference
