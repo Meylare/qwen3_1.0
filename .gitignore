@@ -19,3 +19,5 @@ temp_processing/
 *.wav
 check_text.py
 merge_viralindex_whisper.py
+
+*.png
