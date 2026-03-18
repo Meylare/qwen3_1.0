@@ -81,8 +81,16 @@ def _expand_inputs(
     """
     # Явный список ключей где первая размерность = batch_size.
     # Всё остальное — мультимодальные тензоры, тайлим блоком.
-    # second_per_grids: если процессор его вернёт — он video-индексированный
-    # (первая dim = num_videos ≠ batch_size), поэтому правильно пойдёт в cat.
+    #
+    # Реальные ключи Qwen3OmniMoeProcessor (проверено на живом батче):
+    #   BATCH_KEYS (repeat_interleave):
+    #     input_ids [B, seq], attention_mask [B, seq]
+    #   Блочное тайлирование (cat):
+    #     pixel_values_videos [total_frames, 1536]
+    #     video_grid_thw      [num_videos, 3]
+    #     video_second_per_grid [num_videos]
+    #     feature_attention_mask [num_videos, 1516]
+    #     input_features      [num_videos, 128, 1516]
     BATCH_KEYS = {
         "input_ids", "attention_mask",
         "position_ids", "rope_deltas", "token_type_ids",
@@ -206,8 +214,16 @@ class ViralityCollator:
                 f"Уменьши длину видео, fps, или processor.max_pixels."
             )
 
+        # input_features (аудио) процессор возвращает в float32.
+        # Веса audio_tower в bfloat16 (NF4 квантизация) ->
+        # RuntimeError: Input type (float) and bias type (BFloat16) should be the same.
+        # Кастим float32 тензоры в bfloat16 при переносе на GPU.
+        FLOAT_KEYS = {'input_features', 'pixel_values_videos'}
         model_inputs = {
-            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            k: (v.to(self.device, dtype=torch.bfloat16)
+                if isinstance(v, torch.Tensor) and k in FLOAT_KEYS
+                else v.to(self.device) if isinstance(v, torch.Tensor)
+                else v)
             for k, v in model_inputs.items()
         }
 
@@ -332,18 +348,31 @@ class OmniGRPOTrainer:
         # и мультимодальные тензоры (cat блоком) — см. docstring функции
         expanded = _expand_inputs(model_inputs, self.G)
 
-        # Qwen3OmniMoeThinkerForConditionalGeneration.generate() возвращает
-        # просто тензор (не кортеж) — return_audio не нужен.
-        output_ids = self.model.generate(
-            **expanded,
-            max_new_tokens=self.max_completion_length,
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=0.95,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-            eos_token_id=self.processor.tokenizer.eos_token_id,
-            use_audio_in_video=self.use_audio_in_video,
-        )
+        # КРИТИЧНО: gradient checkpointing несовместим с KV cache.
+        # При включённом checkpointing трансформеры принудительно ставят use_cache=False,
+        # что означает пересчёт K,V для всех токенов на каждой из 600 авторегрессионных
+        # итераций -> O(seq_len^2) операций -> OOM и медленная генерация.
+        #
+        # Решение: отключаем checkpointing только на время generate(), потом включаем обратно.
+        # Безопасно: generate() под @torch.no_grad() — backward не нужен.
+        self.model.gradient_checkpointing_disable()
+        try:
+            output_ids = self.model.generate(
+                **expanded,
+                use_cache=True,  # явно включаем KV cache
+                max_new_tokens=self.max_completion_length,
+                do_sample=True,
+                temperature=self.temperature,
+                top_p=0.95,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+                use_audio_in_video=self.use_audio_in_video,
+            )
+        finally:
+            # Гарантированно включаем checkpointing обратно даже при исключении
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         completion_ids = output_ids[:, prompt_len:].contiguous()
 
