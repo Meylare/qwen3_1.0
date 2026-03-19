@@ -91,7 +91,7 @@ def load_model_and_processor(
 
     common_kwargs = dict(
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
         dtype=torch.bfloat16,
         # LOCAL_RANK задаётся torchrun при multi-GPU запуске.
         # При одиночном запуске (python train.py) переменная отсутствует → GPU 0.
