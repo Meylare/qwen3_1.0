@@ -7,7 +7,7 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    model_path: str = "./Qwen3-Omni-30B-A3B-Thinking"
+    model_path: str = "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
 
     # QLoRA: base model в 4-bit, train только LoRA адаптеры
     # На 96GB это даёт ~15GB для base model, остальное под KV cache + activations
@@ -28,7 +28,7 @@ class DataConfig:
     use_audio_in_video: bool = True
 
     # Максимальная длина видео (секунды). Instagram Reel ≤ 90s → 90 фреймов @ 1fps
-    max_video_duration: float = 90.0
+    max_video_duration: float = 91.0
 
 @dataclass
 class RewardConfig:
