@@ -28,10 +28,15 @@ def parse_answer(completion: str) -> Optional[str]:
     Извлекает 'A' или 'B' из <answer> тега.
 
     Только строгий match по тегу — без fallback на свободный текст.
-    Thinking модель всегда генерирует <answer>X</answer>, fallback
-    создавал false-positive на "Answer about A shows..." внутри <think>.
+
+    ВАЖНО: сначала вырезаем <think>...</think> блок, затем ищем <answer>.
+    Без этого re.search находит первый <answer> в тексте — который может
+    стоять внутри <think> (например модель рассуждает "если бы ответ был
+    <answer>A</answer>..."). Это давало неверный результат.
     """
-    match = ANSWER_RE.search(completion)
+    # Вырезаем think блок перед поиском answer
+    text_without_think = THINK_RE.sub("", completion)
+    match = ANSWER_RE.search(text_without_think)
     if match:
         return match.group(1).upper()
     return None

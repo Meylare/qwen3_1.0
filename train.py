@@ -91,8 +91,8 @@ def load_model_and_processor(
 
     common_kwargs = dict(
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+        dtype=torch.bfloat16,
         # LOCAL_RANK задаётся torchrun при multi-GPU запуске.
         # При одиночном запуске (python train.py) переменная отсутствует → GPU 0.
         # Не используем device_map="auto": при QLoRA + LoRA адаптеры остаются
