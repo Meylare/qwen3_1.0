@@ -63,9 +63,9 @@ fi
 echo ""
 echo "=== [3] PyTorch ==="
 # =============================================================================
-# cu124 покрывает CUDA 12.x (большинство современных AWS инстансов)
-# Если у тебя CUDA 11.8 — замени cu124 на cu118
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# cu128 нужен для Blackwell (sm_120) и CUDA 12.8+
+# Если у тебя CUDA 11.8 — замени cu128 на cu118
+pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"
 echo "✓ PyTorch установлен"
@@ -102,7 +102,7 @@ echo "✓ accelerate, trl, peft, bitsandbytes установлены"
 echo ""
 echo "=== [6] Qwen3-Omni утилиты + decord ==="
 # =============================================================================
-pip install "qwen-omni-utils[decord]>=0.2.0"
+pip install "qwen-omni-utils[decord]>=0.0.9"
 
 # decord отдельно — иногда в qwen-omni-utils идёт старая версия
 pip install "decord>=0.6.0"
@@ -185,15 +185,28 @@ else
     echo "⚠️  Это займёт время (модель ~60GB). Запусти в tmux если нужно."
     echo ""
 
-    # huggingface-cli download надёжнее чем git clone для больших моделей:
-    #   - resume при обрыве
-    #   - параллельная загрузка шардов
-    #   - не тащит весь git history
-    huggingface-cli download \
-        "$MODEL_NAME" \
-        --local-dir "$MODEL_PATH" \
-        --local-dir-use-symlinks False \
-        --resume-download
+    # Скачивание через HF Hub (CLI или Python API) с поддержкой resume
+    if command -v huggingface-cli >/dev/null 2>&1; then
+        huggingface-cli download \
+            "$MODEL_NAME" \
+            --local-dir "$MODEL_PATH" \
+            --local-dir-use-symlinks False \
+            --resume-download
+    else
+        python - <<EOF
+import os
+from huggingface_hub import snapshot_download
+
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+snapshot_download(
+    repo_id="${MODEL_NAME}",
+    local_dir="${MODEL_PATH}",
+    local_dir_use_symlinks=False,
+    resume_download=True,
+    token=token,
+)
+EOF
+    fi
 
     echo "✓ Модель скачана в $MODEL_PATH"
 fi
