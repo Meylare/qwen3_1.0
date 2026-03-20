@@ -126,51 +126,32 @@ class ViralityDataset(Dataset):
                     continue
                 try:
                     item = json.loads(line)
-                    # Валидация
-                    if not self._validate(item):
+                    # Датасет приходит уже отфильтрованным после prepare_dataset.py.
+                    # Единственная проверка здесь — длительность видео,
+                    # чтобы не улететь за лимит контекста модели.
+                    too_long = False
+                    for vid_key in ("video_a", "video_b"):
+                        dur = self._get_duration(item[vid_key])
+                        if dur is not None and dur > self.max_video_duration:
+                            logger.warning(
+                                f"Video too long ({dur:.1f}s > {self.max_video_duration}s): {item[vid_key]}"
+                            )
+                            too_long = True
+                            break
+                    if too_long:
                         skipped += 1
                     else:
-                        # Ground truth label
                         item["label"] = "A" if item["views_a"] > item["views_b"] else "B"
                         self.samples.append(item)
                 except (json.JSONDecodeError, KeyError) as e:
                     logger.warning(f"Skipping malformed line: {e}")
                     skipped += 1
 
-                # Проверяем лимит ПОСЛЕ каждой строки, включая пропущенные
                 if max_samples and len(self.samples) >= max_samples:
                     break
 
         if skipped:
             logger.warning(f"Skipped {skipped} invalid samples")
-
-    def _validate(self, item: Dict) -> bool:
-        required = ["video_a", "video_b", "views_a", "views_b"]
-        for key in required:
-            if key not in item:
-                return False
-        # Проверяем что файлы существуют
-        if not Path(item["video_a"]).exists():
-            logger.warning(f"Video not found: {item['video_a']}")
-            return False
-        if not Path(item["video_b"]).exists():
-            logger.warning(f"Video not found: {item['video_b']}")
-            return False
-        # Пропускаем пары где разница маленькая (< 3x) — сигнал слабый
-        ratio = max(item["views_a"], item["views_b"]) / (
-            min(item["views_a"], item["views_b"]) + 1
-        )
-        if ratio < 3.0:
-            return False
-        # Проверяем длительность видео (без полного декодирования)
-        for vid_key in ("video_a", "video_b"):
-            dur = self._get_duration(item[vid_key])
-            if dur is not None and dur > self.max_video_duration:
-                logger.warning(
-                    f"Video too long ({dur:.1f}s > {self.max_video_duration}s): {item[vid_key]}"
-                )
-                return False
-        return True
 
     def _get_duration(self, path: str) -> Optional[float]:
         """Быстро читает длительность видео через decord (только header)."""

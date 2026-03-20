@@ -154,6 +154,7 @@ class ViralityCollator:
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         from qwen_omni_utils import process_mm_info
+        import time
 
         texts, all_audios, all_images, all_videos = [], [], [], []
 
@@ -163,17 +164,23 @@ class ViralityCollator:
             # process_mm_info:
             # - декодирует видео из path -> list[PIL.Image] @ fps
             # - если use_audio_in_video=True: извлекает аудио -> np.array
+            logger.info("Collator: начинаем process_mm_info...")
+            _t0 = time.time()
             audios, images, videos = process_mm_info(
                 conv,
                 use_audio_in_video=self.use_audio_in_video,
             )
+            logger.info(f"Collator: process_mm_info done — {time.time() - _t0:.1f}s")
 
+            logger.info("Collator: начинаем apply_chat_template...")
+            _t1 = time.time()
             text = self.processor.apply_chat_template(
                 conv,
                 tokenize=False,
                 add_generation_prompt=True,
                 # Thinking модель: <think> всегда включён, флаг не нужен
             )
+            logger.info(f"Collator: apply_chat_template done — {time.time() - _t1:.1f}s")
 
             texts.append(text)
             if audios:
@@ -183,6 +190,8 @@ class ViralityCollator:
             if videos:
                 all_videos.extend(videos)
 
+        logger.info("Collator: начинаем processor()...")
+        _t2 = time.time()
         model_inputs = self.processor(
             text=texts,
             audio=all_audios if all_audios else None,
@@ -204,6 +213,7 @@ class ViralityCollator:
             # - если нужно уменьшить: processor.max_pixels (ресайз кадров)
             use_audio_in_video=self.use_audio_in_video,
         )
+        logger.info(f"Collator: processor() done — {time.time() - _t2:.1f}s")
 
         # Защитный assert: если вход всё-таки превысил контекст — лучше упасть явно,
         # чем молча кормить модель обрезанным промптом без мультимодальных токенов.
