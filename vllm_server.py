@@ -249,9 +249,10 @@ class VLLMOmniServer:
                 "lora_path": lora_adapter_path,
             }
 
-        # Генерируем G completions через n параметр
+        # model: если используется LoRA адаптер — передаём имя адаптера,
+        # иначе vLLM маршрутизирует на base модель и игнорирует lora_request.
         payload = {
-            "model": self.model_path,
+            "model": self.lora_adapter_name if lora_adapter_path else self.model_path,
             "messages": messages,
             "n": G,
             "max_tokens": max_new_tokens,

@@ -117,16 +117,20 @@ def _expand_inputs(
     expanded = {}
     for k, v in model_inputs.items():
         if not isinstance(v, torch.Tensor):
-            # Дублируем списки так же как тензоры
             if isinstance(v, list):
-                expanded[k] = v * G
+                # repeat_interleave для списков: [a,b] → [a,a,b,b] при G=2
+                expanded[k] = [item for item in v for _ in range(G)]
             else:
                 expanded[k] = v
         elif k in BATCH_KEYS:
+            # Batch-индексированные: [a,b] → [a,a,b,b]
             expanded[k] = v.repeat_interleave(G, dim=0)
         else:
-            # pixel_values, video_grid_thw, audio_features, audio_seqlens и т.д.
-            expanded[k] = torch.cat([v] * G, dim=0)
+            # Мультимодальные тензоры (pixel_values, video_grid_thw и т.д.)
+            # КРИТИЧНО: тоже repeat_interleave, не cat([v]*G).
+            # cat даёт [a,b,a,b] — неверный порядок при batch_size>1.
+            # repeat_interleave даёт [a,a,b,b] — совпадает с текстом.
+            expanded[k] = v.repeat_interleave(G, dim=0)
 
     return expanded
 
@@ -270,6 +274,9 @@ class ViralityCollator:
         model_inputs["labels_text"] = [item["label"] for item in batch]
         model_inputs["views_a"] = [item["views_a"] for item in batch]
         model_inputs["views_b"] = [item["views_b"] for item in batch]
+        model_inputs["video_a"] = [item["video_a"] for item in batch]
+        model_inputs["video_b"] = [item["video_b"] for item in batch]
+        model_inputs["author_context"] = [item.get("author_context", "") for item in batch]
 
         return model_inputs
 
@@ -381,25 +388,26 @@ class OmniGRPOTrainer:
     def _generate_completions(
         self,
         model_inputs: Dict[str, torch.Tensor],
-        batch_raw: Optional[Dict] = None,  # оригинальный батч с путями к видео
+        batch_raw: Optional[Dict] = None,
     ) -> Tuple[List[str], torch.Tensor, Dict[str, Any]]:
         """
-        Генерирует G completion'ов.
+        Генерирует G completion'ов через vLLM-Omni.
 
-        Два режима:
-        1. vLLM-Omni режим (если self.vllm_server is not None):
-           - Генерация через vLLM-Omni HTTP API
-           - 30-40 секунд вместо 350 секунд
-           - Требует batch_raw с путями к видео и conversation
-
-        2. HuggingFace режим (fallback):
-           - Генерация через model.generate()
-           - Медленно (~350 секунд) но не требует vLLM-Omni
+        Требует self.vllm_server — без него упадёт явно.
+        HF fallback удалён намеренно: 350 секунд на батч делает
+        обучение нереальным, молчаливый fallback маскирует проблему.
         """
-        if self.vllm_server is not None and batch_raw is not None:
-            return self._generate_via_vllm(model_inputs, batch_raw)
-        else:
-            return self._generate_via_hf(model_inputs)
+        if self.vllm_server is None:
+            raise RuntimeError(
+                "vLLM-Omni сервер не инициализирован. "
+                "Запусти train.py с флагом --use_vllm и укажи --vllm_model_path."
+            )
+        if batch_raw is None:
+            raise RuntimeError(
+                "batch_raw не передан в _generate_completions. "
+                "Это баг в _train_step — video_a/video_b должны приходить из коллатора."
+            )
+        return self._generate_via_vllm(model_inputs, batch_raw)
 
     def _generate_via_vllm(
         self,
@@ -409,21 +417,23 @@ class OmniGRPOTrainer:
         """
         Генерация через vLLM-Omni сервер.
 
-        Отправляет видео пути и промпт в vLLM-Omni,
-        получает G completions, токенизирует их для _compute_logprobs.
+        КРИТИЧНО: промпт строится через build_conversation + apply_chat_template —
+        тот же путь что и в коллаторе. Это гарантирует что токены промпта
+        в vLLM и в _compute_logprobs идентичны.
         """
-        from dataset import SYSTEM_PROMPT
+        from dataset import build_conversation
 
         video_a = batch_raw["video_a"][0]  # batch_size=1
         video_b = batch_raw["video_b"][0]
         author_context = batch_raw.get("author_context", [""])[0]
 
-        user_text = (
-            f"Creator profile: {author_context}\n\n"
-            "Video A (first video above) vs Video B (second video above) — "
-            "both from the same creator. Which received significantly more views?\n\n"
-            "Think through the key factors, then give your answer."
-        )
+        # Строим conversation тем же способом что коллатор
+        item = {
+            "video_a": video_a,
+            "video_b": video_b,
+            "author_context": author_context,
+        }
+        conv = build_conversation(item, video_fps=1)
 
         # Путь к текущему LoRA адаптеру для vLLM-Omni
         lora_path = str(self.lora_sync.sync_path) if self.lora_sync else None
@@ -434,8 +444,7 @@ class OmniGRPOTrainer:
         completions = self.vllm_server.generate(
             video_a_path=video_a,
             video_b_path=video_b,
-            system_prompt=SYSTEM_PROMPT,
-            user_text=user_text,
+            conversation=conv,
             G=self.G,
             max_new_tokens=self.max_completion_length,
             temperature=self.temperature,
@@ -460,31 +469,17 @@ class OmniGRPOTrainer:
     ) -> torch.Tensor:
         """
         Токенизирует текстовые completions от vLLM-Omni в тензор ids.
-
         Нужно для _compute_logprobs который ожидает completion_ids тензор.
         """
         device = model_inputs["input_ids"].device
-        encoded = [
-            self.processor.tokenizer.encode(
-                c, add_special_tokens=False, return_tensors="pt"
-            ).squeeze(0)
-            for c in completions
-        ]
-
-        # Паддинг до одинаковой длины
-        max_len = max(e.shape[0] for e in encoded)
-        padded = []
-        for e in encoded:
-            if e.shape[0] < max_len:
-                pad = torch.full(
-                    (max_len - e.shape[0],),
-                    self.processor.tokenizer.pad_token_id,
-                    dtype=e.dtype,
-                )
-                e = torch.cat([e, pad], dim=0)
-            padded.append(e)
-
-        return torch.stack(padded, dim=0).to(device)  # [G, max_len]
+        encoded = self.processor.tokenizer(
+            completions,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+        )
+        return encoded["input_ids"].to(device)  # [G, max_len]
 
     @torch.no_grad()
     def _generate_via_hf(

@@ -16,6 +16,7 @@ lora_sync.py — синхронизация LoRA весов между HuggingFa
   - Два отдельных процесса не могут читать GPU память друг друга
   - CPU → /dev/shm → CPU единственный безопасный путь
 """
+import atexit
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ class LoRASyncManager:
         vllm_url: str = "http://localhost:8091",
         sync_path: Path = LORA_SYNC_PATH,
         adapter_name: str = LORA_ADAPTER_NAME,
-        timeout: float = 30.0,  # секунд на HTTP запрос
+        timeout: float = 60.0,  # секунд на HTTP запрос (первая загрузка ~34MB может занять 35-40s)
     ):
         self.vllm_url = vllm_url.rstrip("/")
         self.sync_path = Path(sync_path)
@@ -60,6 +61,8 @@ class LoRASyncManager:
 
         # Создаём директорию в /dev/shm при инициализации
         self.sync_path.mkdir(parents=True, exist_ok=True)
+        # Регистрируем cleanup при любом завершении процесса (включая Ctrl+C, kill)
+        atexit.register(self.cleanup)
         logger.info(f"LoRASyncManager initialized: vllm={vllm_url}, sync_path={sync_path}")
 
     def sync(self, model) -> bool:

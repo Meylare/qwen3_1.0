@@ -41,13 +41,20 @@ def parse_args():
     p.add_argument("--model_path", default="./Qwen3-Omni-30B-A3B-Thinking")
     p.add_argument("--output_dir", default="./checkpoints/virality_grpo")
     p.add_argument("--resume", default=None,
-                   help="Путь к чекпоинту для продолжения обучения, например ./checkpoints/virality_grpo/checkpoint-latest")
+                   help="Путь к чекпоинту для продолжения обучения")
     p.add_argument("--wandb", action="store_true",
                    help="Логировать в Weights & Biases")
     p.add_argument("--run_name", default=None,
-                   help="Имя run'а в wandb. По умолчанию генерируется автоматически")
+                   help="Имя run'а в wandb")
     p.add_argument("--debug", action="store_true",
                    help="Загрузить только 20 примеров, 1 эпоха")
+    # vLLM-Omni интеграция
+    p.add_argument("--use_vllm", action="store_true",
+                   help="Использовать vLLM-Omni для быстрой генерации")
+    p.add_argument("--vllm_model_path", default=None,
+                   help="Путь к AWQ модели для vLLM-Omni. По умолчанию = model_path")
+    p.add_argument("--vllm_port", type=int, default=8091,
+                   help="Порт vLLM-Omni сервера")
     return p.parse_args()
 
 
@@ -120,6 +127,22 @@ def load_model_and_processor(
     # без него градиент не течёт через frozen base layers в LoRA адаптеры
     model.enable_input_require_grads()
     model.print_trainable_parameters()
+
+    # Диагностика устройств — проверяем что все части модели на GPU
+    logger.info("=== Device diagnostics ===")
+    devices_seen = {}
+    for name, param in model.named_parameters():
+        dev = str(param.device)
+        if dev not in devices_seen:
+            devices_seen[dev] = name
+            logger.info(f"  {dev}: e.g. {name}")
+    for keyword in ("visual", "vision", "audio", "embed_tokens"):
+        for name, param in model.named_parameters():
+            if keyword in name:
+                logger.info(f"  [{keyword}] {name}: {param.device}")
+                break
+    logger.info("=== End device diagnostics ===")
+
     # use_reentrant=False обязателен с PEFT/LoRA на PyTorch >= 2.0
     # use_reentrant=True (default) несовместим с autograd hooks которые добавляет LoRA
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -267,6 +290,32 @@ def main():
         tokenizer=processor.tokenizer,
     )
 
+    # ── vLLM-Omni (опционально) ──────────────────────────────
+    vllm_server = None
+    lora_sync = None
+
+    if args.use_vllm:
+        from vllm_server import VLLMOmniServer
+        from lora_sync import LoRASyncManager, wait_for_initial_sync
+
+        vllm_model_path = args.vllm_model_path or args.model_path
+        logger.info(f"Starting vLLM-Omni server with model: {vllm_model_path}")
+
+        vllm_server = VLLMOmniServer(
+            model_path=vllm_model_path,
+            port=args.vllm_port,
+        )
+        vllm_server.start(wait=True)
+        logger.info("vLLM-Omni server ready")
+
+        lora_sync = LoRASyncManager(
+            vllm_url=f"http://localhost:{args.vllm_port}",
+        )
+
+        # Загружаем начальные LoRA веса в vLLM-Omni
+        wait_for_initial_sync(lora_sync, model)
+        logger.info("Initial LoRA sync complete")
+
     # ── Тренер ───────────────────────────────────────────────
     trainer = OmniGRPOTrainer(
         model=model,
@@ -289,9 +338,10 @@ def main():
         save_steps=cfg.grpo.save_steps,
         weight_decay=cfg.grpo.weight_decay,
         use_wandb=args.wandb and WANDB_AVAILABLE,
-        # temperature должна совпадать с generate() внутри тренера:
-        # logprob computation делит logits на это же значение
         temperature=cfg.grpo.temperature,
+        # vLLM-Omni интеграция
+        vllm_server=vllm_server,
+        lora_sync=lora_sync,
     )
 
     # Resume from checkpoint если передан --resume
@@ -299,7 +349,14 @@ def main():
         trainer.load_checkpoint(args.resume)
 
     # ── Поехали ──────────────────────────────────────────────
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        # Гарантированно останавливаем vLLM-Omni сервер
+        if vllm_server is not None:
+            vllm_server.stop()
+        if lora_sync is not None:
+            lora_sync.cleanup()
 
 
 if __name__ == "__main__":
