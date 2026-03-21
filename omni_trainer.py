@@ -30,6 +30,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, get_cosine_schedule_with_warmup
 
+# vLLM-Omni интеграция — опциональная, используется если передан vllm_server
+try:
+    from vllm_server import VLLMOmniServer
+    from lora_sync import LoRASyncManager
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,7 +117,11 @@ def _expand_inputs(
     expanded = {}
     for k, v in model_inputs.items():
         if not isinstance(v, torch.Tensor):
-            expanded[k] = v
+            # Дублируем списки так же как тензоры
+            if isinstance(v, list):
+                expanded[k] = v * G
+            else:
+                expanded[k] = v
         elif k in BATCH_KEYS:
             expanded[k] = v.repeat_interleave(G, dim=0)
         else:
@@ -172,6 +184,16 @@ class ViralityCollator:
             )
             logger.info(f"Collator: process_mm_info done — {time.time() - _t0:.1f}s")
 
+            # Если аудио отключено — явно зануляем результат process_mm_info
+            # и чистим аудио из conv чтобы processor() не нашёл его самостоятельно
+            if not self.use_audio_in_video:
+                audios = []
+                for msg in conv:
+                    if isinstance(msg.get("content"), list):
+                        for part in msg["content"]:
+                            if part.get("type") == "audio":
+                                part.pop("audio", None)
+
             logger.info("Collator: начинаем apply_chat_template...")
             _t1 = time.time()
             text = self.processor.apply_chat_template(
@@ -194,7 +216,7 @@ class ViralityCollator:
         _t2 = time.time()
         model_inputs = self.processor(
             text=texts,
-            audio=all_audios if all_audios else None,
+            audio=all_audios if (all_audios and self.use_audio_in_video) else None,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
             return_tensors="pt",
@@ -214,6 +236,14 @@ class ViralityCollator:
             use_audio_in_video=self.use_audio_in_video,
         )
         logger.info(f"Collator: processor() done — {time.time() - _t2:.1f}s")
+
+        # Если аудио отключено — удаляем audio фичи которые processor всё равно
+        # создаёт из видео. Без этого audio tower обрабатывает их в generate()
+        # и _compute_logprobs, загружая CPU на 100% при каждом токене.
+        if not self.use_audio_in_video:
+            model_inputs.pop("input_features", None)
+            model_inputs.pop("feature_attention_mask", None)
+            logger.info("Collator: audio features removed from batch (use_audio_in_video=False)")
 
         # Защитный assert: если вход всё-таки превысил контекст — лучше упасть явно,
         # чем молча кормить модель обрезанным промптом без мультимодальных токенов.
@@ -282,7 +312,12 @@ class OmniGRPOTrainer:
         max_grad_norm: float = 1.0,
         weight_decay: float = 0.01,
         use_wandb: bool = False,
-        temperature: float = 0.9,  # должна совпадать с temperature в generate()
+        temperature: float = 0.9,
+        # vLLM-Omni интеграция — опциональная
+        # Если передан vllm_server — генерация идёт через vLLM-Omni (быстро)
+        # Если None — генерация через HuggingFace generate() (медленно)
+        vllm_server=None,
+        lora_sync=None,
     ):
         self.model = model
         self.processor = processor
@@ -303,6 +338,14 @@ class OmniGRPOTrainer:
         self.temperature = temperature
         self.global_step = 0
         self._accum_step = 0
+
+        # vLLM-Omni интеграция
+        self.vllm_server = vllm_server
+        self.lora_sync = lora_sync
+        if vllm_server is not None:
+            logger.info("vLLM-Omni mode: generation via vLLM-Omni server")
+        else:
+            logger.info("HuggingFace mode: generation via model.generate()")
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -338,62 +381,174 @@ class OmniGRPOTrainer:
     def _generate_completions(
         self,
         model_inputs: Dict[str, torch.Tensor],
+        batch_raw: Optional[Dict] = None,  # оригинальный батч с путями к видео
     ) -> Tuple[List[str], torch.Tensor, Dict[str, Any]]:
         """
-        Генерирует G completion'ов для каждого примера в батче.
+        Генерирует G completion'ов.
 
-        Возвращает также expanded_inputs чтобы избежать повторного вызова
-        _expand_inputs в _train_step — pixel_values при двух видео ~3GB,
-        двойная аллокация расточительна.
+        Два режима:
+        1. vLLM-Omni режим (если self.vllm_server is not None):
+           - Генерация через vLLM-Omni HTTP API
+           - 30-40 секунд вместо 350 секунд
+           - Требует batch_raw с путями к видео и conversation
 
-        Qwen3OmniMoeThinkerForConditionalGeneration.generate() возвращает
-        plain тензор (не кортеж), аудио output отсутствует архитектурно.
-        Thinker автоматически производит:
-          <think>[reasoning]</think>
-          <answer>A</answer>
+        2. HuggingFace режим (fallback):
+           - Генерация через model.generate()
+           - Медленно (~350 секунд) но не требует vLLM-Omni
+        """
+        if self.vllm_server is not None and batch_raw is not None:
+            return self._generate_via_vllm(model_inputs, batch_raw)
+        else:
+            return self._generate_via_hf(model_inputs)
+
+    def _generate_via_vllm(
+        self,
+        model_inputs: Dict[str, torch.Tensor],
+        batch_raw: Dict,
+    ) -> Tuple[List[str], torch.Tensor, Dict[str, Any]]:
+        """
+        Генерация через vLLM-Omni сервер.
+
+        Отправляет видео пути и промпт в vLLM-Omni,
+        получает G completions, токенизирует их для _compute_logprobs.
+        """
+        from dataset import SYSTEM_PROMPT
+
+        video_a = batch_raw["video_a"][0]  # batch_size=1
+        video_b = batch_raw["video_b"][0]
+        author_context = batch_raw.get("author_context", [""])[0]
+
+        user_text = (
+            f"Creator profile: {author_context}\n\n"
+            "Video A (first video above) vs Video B (second video above) — "
+            "both from the same creator. Which received significantly more views?\n\n"
+            "Think through the key factors, then give your answer."
+        )
+
+        # Путь к текущему LoRA адаптеру для vLLM-Omni
+        lora_path = str(self.lora_sync.sync_path) if self.lora_sync else None
+
+        logger.info(f"vLLM-Omni generate: G={self.G}, video_a={video_a}, video_b={video_b}")
+        t0 = __import__("time").time()
+
+        completions = self.vllm_server.generate(
+            video_a_path=video_a,
+            video_b_path=video_b,
+            system_prompt=SYSTEM_PROMPT,
+            user_text=user_text,
+            G=self.G,
+            max_new_tokens=self.max_completion_length,
+            temperature=self.temperature,
+            top_p=0.95,
+            lora_adapter_path=lora_path,
+        )
+
+        logger.info(f"vLLM-Omni generate done in {__import__('time').time() - t0:.1f}s")
+
+        # Токенизируем completions для _compute_logprobs
+        completion_ids = self._tokenize_completions(completions, model_inputs)
+
+        # Расширяем входы до B*G для _compute_logprobs
+        expanded = _expand_inputs(model_inputs, self.G)
+
+        return completions, completion_ids, expanded
+
+    def _tokenize_completions(
+        self,
+        completions: List[str],
+        model_inputs: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Токенизирует текстовые completions от vLLM-Omni в тензор ids.
+
+        Нужно для _compute_logprobs который ожидает completion_ids тензор.
+        """
+        device = model_inputs["input_ids"].device
+        encoded = [
+            self.processor.tokenizer.encode(
+                c, add_special_tokens=False, return_tensors="pt"
+            ).squeeze(0)
+            for c in completions
+        ]
+
+        # Паддинг до одинаковой длины
+        max_len = max(e.shape[0] for e in encoded)
+        padded = []
+        for e in encoded:
+            if e.shape[0] < max_len:
+                pad = torch.full(
+                    (max_len - e.shape[0],),
+                    self.processor.tokenizer.pad_token_id,
+                    dtype=e.dtype,
+                )
+                e = torch.cat([e, pad], dim=0)
+            padded.append(e)
+
+        return torch.stack(padded, dim=0).to(device)  # [G, max_len]
+
+    @torch.no_grad()
+    def _generate_via_hf(
+        self,
+        model_inputs: Dict[str, torch.Tensor],
+    ) -> Tuple[List[str], torch.Tensor, Dict[str, Any]]:
+        """
+        Fallback генерация через HuggingFace model.generate().
+        Медленно (~350 секунд на пару видео) но не требует vLLM-Omni.
         """
         prompt_len = model_inputs["input_ids"].shape[1]
 
-        # _expand_inputs корректно обрабатывает batch-тензоры (repeat_interleave)
-        # и мультимодальные тензоры (cat блоком) — см. docstring функции
-        expanded = _expand_inputs(model_inputs, self.G)
-
-        # КРИТИЧНО: gradient checkpointing несовместим с KV cache.
-        # При включённом checkpointing трансформеры принудительно ставят use_cache=False,
-        # что означает пересчёт K,V для всех токенов на каждой из 600 авторегрессионных
-        # итераций -> O(seq_len^2) операций -> OOM и медленная генерация.
-        #
-        # Решение: отключаем checkpointing только на время generate(), потом включаем обратно.
-        # Безопасно: generate() под @torch.no_grad() — backward не нужен.
+        self.model.eval()
         self.model.gradient_checkpointing_disable()
+
+        logger.info(f"HF generate() seq_len={model_inputs['input_ids'].shape[1]}, G={self.G}")
+
+        all_completion_ids = []
+        all_completions = []
+
         try:
-            output_ids = self.model.generate(
-                **expanded,
-                use_cache=True,  # явно включаем KV cache
-                max_new_tokens=self.max_completion_length,
-                do_sample=True,
-                temperature=self.temperature,
-                top_p=0.95,
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
-                use_audio_in_video=self.use_audio_in_video,
-            )
+            for g in range(self.G):
+                logger.info(f"HF generate() call {g+1}/{self.G}...")
+                output_ids = self.model.generate(
+                    **model_inputs,
+                    use_cache=True,
+                    max_new_tokens=self.max_completion_length,
+                    do_sample=True,
+                    temperature=self.temperature,
+                    top_p=0.95,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                    use_audio_in_video=self.use_audio_in_video,
+                )
+                c_ids = output_ids[:, prompt_len:].contiguous()
+                all_completion_ids.append(c_ids)
+                texts = self.processor.tokenizer.batch_decode(
+                    c_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                all_completions.extend(texts)
+                logger.info(f"HF generate() call {g+1}/{self.G} done")
         finally:
-            # Гарантированно включаем checkpointing обратно даже при исключении
+            self.model.train()
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
-        completion_ids = output_ids[:, prompt_len:].contiguous()
+        max_len = max(c.shape[1] for c in all_completion_ids)
+        padded = []
+        for c in all_completion_ids:
+            if c.shape[1] < max_len:
+                pad = torch.full(
+                    (c.shape[0], max_len - c.shape[1]),
+                    self.processor.tokenizer.pad_token_id,
+                    device=c.device, dtype=c.dtype,
+                )
+                c = torch.cat([c, pad], dim=1)
+            padded.append(c)
+        completion_ids = torch.cat(padded, dim=0)
 
-        completions = self.processor.tokenizer.batch_decode(
-            completion_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        # Возвращаем expanded: он уже аллоцирован, повторно использовать
-        # для _compute_logprobs дешевле чем звать _expand_inputs второй раз.
-        return completions, completion_ids, expanded
+        expanded = _expand_inputs(model_inputs, self.G)
+        return all_completions, completion_ids, expanded
 
     # ──────────────────────────────────────────────────────────────────────────
     # LOG-PROBABILITIES
@@ -554,17 +709,22 @@ class OmniGRPOTrainer:
     def _train_step(self, batch: Dict) -> Dict:
         # Не мутируем dict из DataLoader — делаем копию без метаданных
         labels_text = batch["labels_text"]
+        # batch_raw нужен для vLLM-Omni режима — содержит пути к видео
+        batch_raw = {
+            "video_a": batch.get("video_a"),
+            "video_b": batch.get("video_b"),
+            "author_context": batch.get("author_context"),
+        }
         model_inputs = {
             k: v for k, v in batch.items()
-            if k not in ("labels_text", "views_a", "views_b")
+            if k not in ("labels_text", "views_a", "views_b", "video_a", "video_b", "author_context")
         }
         batch_size = model_inputs["input_ids"].shape[0]
 
-        # 1. Генерация — dropout отключён глобально в __init__,
-        # поэтому generation и logprob computation используют одно распределение.
-        # _generate_completions возвращает expanded_inputs чтобы не аллоцировать
-        # pixel_values (~3GB) дважды.
-        completions, completion_ids, expanded_inputs = self._generate_completions(model_inputs)
+        # 1. Генерация
+        completions, completion_ids, expanded_inputs = self._generate_completions(
+            model_inputs, batch_raw=batch_raw
+        )
         torch.cuda.empty_cache()
 
         # 2. Reward
@@ -639,6 +799,10 @@ class OmniGRPOTrainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
+
+                    # Синхронизируем LoRA веса в vLLM-Omni после каждого шага
+                    if self.lora_sync is not None:
+                        self.lora_sync.sync(self.model)
 
                     if self.global_step % self.logging_steps == 0:
                         lr = self.scheduler.get_last_lr()[0]
