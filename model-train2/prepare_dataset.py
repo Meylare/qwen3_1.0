@@ -117,10 +117,18 @@ def build_dataset(
     augment_swap: bool = True,
     seed: int = 42,
 ) -> None:
+    base_dir = pathlib.Path(__file__).resolve().parent
+    input_path_p = pathlib.Path(input_path)
+    if not input_path_p.is_absolute():
+        input_path_p = base_dir / input_path_p
+    output_dir_p = pathlib.Path(output_dir)
+    if not output_dir_p.is_absolute():
+        output_dir_p = base_dir / output_dir_p
+
     random.seed(seed)
 
     raw: list[dict] = []
-    with open(input_path) as f:
+    with open(input_path_p) as f:
         for i, line in enumerate(f):
             line = line.strip()
             if not line:
@@ -155,8 +163,7 @@ def build_dataset(
         print(f"{split_name}: {len(split)} примеров | confidence: {dict(conf_counts)}")
 
     # Запись
-    out = pathlib.Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    output_dir_p.mkdir(parents=True, exist_ok=True)
 
     def _write(path: pathlib.Path, items: list[dict]) -> None:
         with open(path, "w", encoding="utf-8") as f:
@@ -166,8 +173,8 @@ def build_dataset(
                 f.write(json.dumps(clean, ensure_ascii=False) + "\n")
         print(f"  Записано: {path}  ({len(items)} строк)")
 
-    _write(out / "train.jsonl", train_examples)
-    _write(out / "val.jsonl",   val_examples)
+    _write(output_dir_p / "train.jsonl", train_examples)
+    _write(output_dir_p / "val.jsonl",   val_examples)
 
 
 if __name__ == "__main__":

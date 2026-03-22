@@ -26,6 +26,9 @@
 
 set -euo pipefail
 
+# Абсолютные пути, чтобы запускать из любой директории
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # 1. PATHS & IDENTIFIERS
 # ---------------------------------------------------------------------------
@@ -34,9 +37,11 @@ set -euo pipefail
 MODEL_ID="Qwen/Qwen3-Omni-30B-A3B-Thinking"
 # MODEL_ID="/path/to/local/Qwen3-Omni-30B-A3B-Thinking"   # или локальный путь
 
-OUTPUT_DIR="./output/qwen3omni_30b_a3b_thinking_gspo"
-DATASET_PATH="./data/train.jsonl"
-VAL_DATASET_PATH="./data/val.jsonl"
+OUTPUT_DIR="${SCRIPT_DIR}/output/qwen3omni_30b_a3b_thinking_gspo"
+DATASET_PATH="${SCRIPT_DIR}/data/train.jsonl"
+VAL_DATASET_PATH="${SCRIPT_DIR}/data/val.jsonl"
+REWARD_FUNCS_PATH="${SCRIPT_DIR}/reward_functions.py"
+DEEPSPEED_CONFIG="${SCRIPT_DIR}/ds_zero2.json"
 
 # ---------------------------------------------------------------------------
 # 2. DISTRIBUTED TRAINING SETTINGS
@@ -88,7 +93,7 @@ torchrun \
     --thinking_mode true \
     --thinking_budget 16384 \
     \
-    --reward_funcs_path reward_functions.py \
+    --reward_funcs_path "${REWARD_FUNCS_PATH}" \
     --reward_funcs virality_accuracy virality_format virality_calibration \
     \
     --sft_type lora \
@@ -119,7 +124,7 @@ torchrun \
     \
     --dataloader_num_workers 4 \
     --output_dir "${OUTPUT_DIR}" \
-    --deepspeed ds_zero2.json \
+    --deepspeed "${DEEPSPEED_CONFIG}" \
     \
     --report_to tensorboard \
     --logging_dir "${OUTPUT_DIR}/tb_logs"
