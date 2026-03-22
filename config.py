@@ -7,7 +7,7 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    model_path: str = "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
+    model_path: str = "/home/ubuntu/models/qwen3-omni-30b-thinking-awq-4bit"
 
     # QLoRA: base model в 4-bit, train только LoRA адаптеры
     # На 96GB это даёт ~15GB для base model, остальное под KV cache + activations
@@ -96,7 +96,7 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    model_path: str = "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
+    model_path: str = "/home/ubuntu/models/qwen3-omni-30b-thinking-awq-4bit"
 
     # QLoRA: base model в 4-bit, train только LoRA адаптеры
     # На 96GB это даёт ~15GB для base model, остальное под KV cache + activations
@@ -185,7 +185,7 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    model_path: str = "/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
+    model_path: str = "/home/ubuntu/models/qwen3-omni-30b-thinking-awq-4bit"
 
     # QLoRA: base model в 4-bit, train только LoRA адаптеры
     # На 96GB это даёт ~15GB для base model, остальное под KV cache + activations

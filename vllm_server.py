@@ -77,7 +77,7 @@ class VLLMOmniServer:
 
     Использование:
         server = VLLMOmniServer(
-            model_path="/home/ubuntu/models/Qwen3-Omni-30B-A3B-AWQ",
+            model_path="/home/ubuntu/models/qwen3-omni-30b-thinking-awq-4bit",
             lora_adapter_name="virality_grpo",
         )
         server.start()

@@ -129,7 +129,7 @@ class LoRASyncManager:
         {
             "lora_name": "virality_grpo",
             "lora_path": "/dev/shm/virality_lora_sync",
-            "base_model_name": "Qwen3-Omni-30B-A3B-AWQ"
+            "base_model_name": "qwen3-omni-30b-thinking-awq-4bit"
         }
 
         Требует: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True на сервере

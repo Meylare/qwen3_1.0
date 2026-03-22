@@ -58,6 +58,20 @@ def parse_args():
     return p.parse_args()
 
 
+def _is_awq_model(model_path: str) -> bool:
+    """Проверяет является ли модель AWQ по config.json."""
+    import json
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        quant_cfg = cfg.get("quantization_config", {})
+        return quant_cfg.get("quant_type", "").lower() == "awq" or \
+               quant_cfg.get("quantization_bit", 0) == 4 and "awq" in str(cfg).lower()
+    except Exception:
+        return "awq" in model_path.lower()
+
+
 def load_model_and_processor(
     model_path: str,
     use_qlora: bool = True,
@@ -67,18 +81,16 @@ def load_model_and_processor(
     lora_target_modules=None,
 ):
     """
-    Загружает Qwen3-Omni в режиме Thinking + Thinker-only (без Talker/речи).
+    Загружает Qwen3-Omni Thinker + LoRA адаптер.
 
-    Thinking модель: <think>...</think> всегда включён безусловно.
-    Квантизация: оба (policy + ref) в NF4 4-bit.
-    На 96GB: ~15GB policy + ~15GB ref + ~20GB optimizer states + ~30GB KV/activations.
+    Поддерживает два режима квантизации:
+    - AWQ модель: загружается напрямую без BitsAndBytesConfig,
+      LoRA применяется через autoawq совместимый режим PEFT
+    - NF4 модель: стандартный QLoRA через BitsAndBytesConfig
     """
     if lora_target_modules is None:
         lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    # Qwen3OmniMoeThinkerForConditionalGeneration — text-only вариант:
-    #   - generate() возвращает просто тензор (не кортеж), не нужен return_audio=False
-    #   - Talker не загружается совсем → экономия ~10GB vs enable_audio_output=False
-    #   - Это именно то что содержит Qwen3-Omni-30B-A3B-Thinking чекпоинт
+
     from transformers import Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeProcessor, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, TaskType
 
@@ -88,22 +100,25 @@ def load_model_and_processor(
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    # BitsAndBytes конфиг объявляем один раз — используется для обоих загрузок
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    ) if use_qlora else None
+    is_awq = _is_awq_model(model_path)
+
+    if is_awq:
+        # AWQ модель уже квантизирована — не накладываем NF4 поверх.
+        # BitsAndBytesConfig несовместим с AWQ весами (нет compress_statistics).
+        logger.info("Detected AWQ model — skipping BitsAndBytesConfig")
+        bnb_config = None
+    else:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        ) if use_qlora else None
 
     common_kwargs = dict(
         trust_remote_code=True,
         attn_implementation="sdpa",
         dtype=torch.bfloat16,
-        # LOCAL_RANK задаётся torchrun при multi-GPU запуске.
-        # При одиночном запуске (python train.py) переменная отсутствует → GPU 0.
-        # Не используем device_map="auto": при QLoRA + LoRA адаптеры остаются
-        # на GPU 0 пока base model распределяется — gradient flow ломается.
         device_map={"": int(os.environ.get("LOCAL_RANK", 0))},
     )
     if bnb_config:
@@ -118,7 +133,8 @@ def load_model_and_processor(
         bias="none",
     )
 
-    logger.info("Loading policy model (Qwen3-Omni Thinker, NF4 4-bit)...")
+    quant_type = "AWQ" if is_awq else "NF4 4-bit"
+    logger.info(f"Loading policy model (Qwen3-Omni Thinker, {quant_type})...")
     model = get_peft_model(
         Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(model_path, **common_kwargs),
         lora_config,
