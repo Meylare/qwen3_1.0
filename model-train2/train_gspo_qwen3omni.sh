@@ -86,8 +86,7 @@ torchrun \
     \
     --enable_thinking true \
     \
-    --reward_model_plugin "${REWARD_FUNCS_PATH}" \
-    --reward_funcs virality_accuracy virality_format virality_calibration \
+    --reward_funcs accuracy \
     \
     --tuner_type lora \
     --lora_rank 64 \
