@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from swift.plugin import register_reward
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,6 +47,7 @@ def _extract_choice(text: str) -> str | None:
 # 1. Accuracy — правильно ли выбрано видео
 # ---------------------------------------------------------------------------
 
+@register_reward('virality_accuracy')
 def virality_accuracy(
     completions: list[str],
     solution: list[str],
@@ -68,6 +71,7 @@ def virality_accuracy(
 # 2. Format — структура ответа
 # ---------------------------------------------------------------------------
 
+@register_reward('virality_format')
 def virality_format(
     completions: list[str],
     **kwargs: Any,
@@ -102,6 +106,7 @@ def virality_format(
 # 3. Calibration — глубина и соразмерность анализа
 # ---------------------------------------------------------------------------
 
+@register_reward('virality_calibration')
 def virality_calibration(
     completions: list[str],
     views_a: list[int] | None = None,

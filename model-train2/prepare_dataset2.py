@@ -82,7 +82,7 @@ def _make_example(row: dict, swap: bool = False) -> dict:
     winner = "A" if views_a > views_b else "B"
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
         {
             "role": "user",
             "content": [
