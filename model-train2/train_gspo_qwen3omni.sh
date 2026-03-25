@@ -86,7 +86,7 @@ torchrun \
     \
     --use_vllm true \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.4 \
+    --vllm_gpu_memory_utilization 0.7 \
     --vllm_enforce_eager \
     --vllm_limit_mm_per_prompt '{"video": 2}' \
     \
@@ -99,7 +99,7 @@ torchrun \
     --lora_rank 64 \
     --lora_alpha 128 \
     --lora_dropout 0.05 \
-    --target_modules q_proj k_proj v_proj o_proj merger \
+    --target_modules q_proj k_proj v_proj o_proj \
     \
     --quant_method bnb \
     --quant_bits 4 \
