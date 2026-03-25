@@ -87,6 +87,7 @@ torchrun \
     --use_vllm true \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization 0.4 \
+    --vllm_enforce_eager \
     --vllm_limit_mm_per_prompt '{"video": 2}' \
     \
     --enable_thinking true \
