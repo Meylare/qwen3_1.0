@@ -84,15 +84,21 @@ torchrun \
     --beta 0.001 \
     --scale_rewards group \
     \
+    --use_vllm true \
+    --vllm_mode colocate \
+    --vllm_gpu_memory_utilization 0.4 \
+    --vllm_limit_mm_per_prompt '{"video": 2}' \
+    \
     --enable_thinking true \
     \
     --reward_funcs accuracy \
     \
+    --freeze_aligner false \
     --tuner_type lora \
     --lora_rank 64 \
     --lora_alpha 128 \
     --lora_dropout 0.05 \
-    --target_modules all-linear \
+    --target_modules q_proj k_proj v_proj o_proj merger \
     \
     --quant_method bnb \
     --quant_bits 4 \
