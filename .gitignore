@@ -6,3 +6,5 @@ __pycache__/
 tests/
 /data
 .venv3/
+output/
+*.bak

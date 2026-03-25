@@ -81,18 +81,16 @@ def _make_example(row: dict, swap: bool = False) -> dict:
     # Ground truth: какое видео победило?
     winner = "A" if views_a > views_b else "B"
 
+    user_text = (
+        f"Контекст канала: {context}\n\n"
+        f"Видео A: <video>{va}</video>\n"
+        f"Видео B: <video>{vb}</video>\n"
+        f"Какое видео наберёт больше просмотров — A или B?"
+    )
+
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text",  "text": f"Контекст канала: {context}\n\nВидео A:"},
-                {"type": "video", "video": va},
-                {"type": "text",  "text": "Видео B:"},
-                {"type": "video", "video": vb},
-                {"type": "text",  "text": "Какое видео наберёт больше просмотров — A или B?"},
-            ],
-        },
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_text},
     ]
 
     return {
