@@ -125,6 +125,15 @@ def main() -> None:
         trust_remote_code=trust_remote_code,
     )
 
+    # Some upstream checkpoints ship generation settings that are inconsistent
+    # (e.g. do_sample=False with temperature/top_p/top_k set), which causes
+    # save_pretrained() to fail on strict GenerationConfig validation.
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is not None and getattr(gen_cfg, "do_sample", False) is False:
+        for field in ("temperature", "top_p", "top_k"):
+            if getattr(gen_cfg, field, None) is not None:
+                setattr(gen_cfg, field, None)
+
     print(f"[3/4] Saving quantized model to: {dst_model}")
     model.save_pretrained(str(dst_model), safe_serialization=True)
     processor.save_pretrained(str(dst_model))
