@@ -56,6 +56,9 @@ torchrun \
     \
     --use_vllm true \
     --vllm_mode colocate \
+    --vllm_enable_lora true \
+    --vllm_max_lora_rank 64 \
+    --vllm_quantization bitsandbytes \
     --vllm_gpu_memory_utilization 0.44 \
     --vllm_max_model_len 4096 \
     --vllm_enforce_eager \
