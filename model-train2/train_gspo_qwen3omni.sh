@@ -29,8 +29,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # 1. PATHS & IDENTIFIERS
 # ---------------------------------------------------------------------------
-MODEL_ID="/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
-# MODEL_ID="Qwen/Qwen3-Omni-30B-A3B-Thinking"
+MODEL_ID="/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking-bnb4-nf4"
+# MODEL_ID="/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
 
 OUTPUT_DIR="${SCRIPT_DIR}/output/qwen3omni_30b_a3b_thinking_gspo"
 DATASET_PATH="${SCRIPT_DIR}/data/train.jsonl"

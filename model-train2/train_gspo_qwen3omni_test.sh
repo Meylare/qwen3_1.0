@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-MODEL_ID="/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking"
+MODEL_ID="/home/ubuntu/models/Qwen3-Omni-30B-A3B-Thinking-bnb4-nf4"
 OUTPUT_DIR="${SCRIPT_DIR}/output/qwen3omni_30b_a3b_thinking_gspo_test"
 DATASET_PATH="${SCRIPT_DIR}/data/train.jsonl"
 VAL_DATASET_PATH="${SCRIPT_DIR}/data/val.jsonl"
