@@ -1,6 +1,6 @@
 # Qwen3.5 GSPO Smoke Stack
 
-This directory contains a realistic throughput smoke pipeline for pairwise virality training on `Qwen/Qwen3.5-9B-Base`.
+This directory contains a realistic throughput smoke pipeline for pairwise virality training on a local `Qwen3.5-9B-Base` checkpoint.
 
 What it checks:
 
@@ -15,6 +15,7 @@ Important implementation notes:
 
 - The smoke setup keeps the input load close to the intended final training setup.
 - The simplification is only in the reward and in the number of training pairs.
+- The scripts expect the base model in `C:/Projects/GPRO_producer/models/Qwen3.5-9B-Base` by default.
 - Qwen3.5 RL is wired through Unsloth inference (`fast_inference=False`), not through `vLLM 0.16.0`.
 - The default training mode is now regular bf16 LoRA. `--load_in_4bit` is still available as an explicit fallback if you want to compare it against QLoRA.
 
@@ -24,4 +25,10 @@ Quickstart:
 cd model-train/model-train4
 bash setup_env.sh
 bash run_gspo_qwen35_smoke.sh
+```
+
+Override the local model path if needed:
+
+```bash
+MODEL_PATH=/absolute/path/to/Qwen3.5-9B-Base bash run_gspo_qwen35_smoke.sh
 ```

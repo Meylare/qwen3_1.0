@@ -6,6 +6,7 @@ VENV_DIR="${SCRIPT_DIR}/.venv"
 DATA_DIR="${SCRIPT_DIR}/data"
 OUTPUT_DIR="${SCRIPT_DIR}/output/qwen35_9b_base_gspo_smoke"
 TRAIN_JSONL="${TRAIN_JSONL:-${SCRIPT_DIR}/../../train.jsonl}"
+MODEL_PATH="${MODEL_PATH:-${SCRIPT_DIR}/../../models/Qwen3.5-9B-Base}"
 SMOKE_PAIRS="${SMOKE_PAIRS:-10}"
 WHISPER_MODEL="${WHISPER_MODEL:-small}"
 
@@ -27,6 +28,7 @@ python "${SCRIPT_DIR}/prepare_smoke_dataset.py" \
 
 echo ">>> Running GSPO smoke training"
 python "${SCRIPT_DIR}/train_gspo_qwen35_smoke.py" \
+  --model_name "${MODEL_PATH}" \
   --train_dataset "${DATA_DIR}/train.jsonl" \
   --eval_dataset "${DATA_DIR}/eval.jsonl" \
   --output_dir "${OUTPUT_DIR}" \
@@ -39,6 +41,7 @@ fi
 
 echo ">>> Running post-train inference on first eval sample"
 python "${SCRIPT_DIR}/infer_pair_checkpoint.py" \
+  --base_model "${MODEL_PATH}" \
   --adapter_dir "${OUTPUT_DIR}/final_lora" \
   --dataset_jsonl "${INFER_DATASET}" \
   --sample_index 0 \

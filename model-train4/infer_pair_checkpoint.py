@@ -13,9 +13,12 @@ from typing import Any, Dict
 import torch
 
 
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "Qwen3.5-9B-Base"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Infer one pair with a Qwen3.5 LoRA checkpoint.")
-    parser.add_argument("--base_model", default="Qwen/Qwen3.5-9B-Base")
+    parser.add_argument("--base_model", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--adapter_dir", type=Path, required=True)
     parser.add_argument("--dataset_jsonl", type=Path, required=True)
     parser.add_argument("--sample_index", type=int, default=0)
@@ -35,9 +38,20 @@ def load_jsonl_row(path: Path, index: int) -> Dict[str, Any]:
     raise IndexError(f"Sample index {index} out of range for {path}")
 
 
+def resolve_model_path(model_name: str) -> str:
+    model_path = Path(model_name).expanduser()
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Local model path not found: {model_path}. "
+            f"Download the base model into {DEFAULT_MODEL_DIR} or pass --base_model explicitly."
+        )
+    return str(model_path.resolve())
+
+
 def main() -> None:
     args = parse_args()
     sample = load_jsonl_row(args.dataset_jsonl, args.sample_index)
+    resolved_base_model = resolve_model_path(args.base_model)
 
     from peft import PeftModel
     from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3_5ForConditionalGeneration
@@ -55,12 +69,12 @@ def main() -> None:
             bnb_4bit_use_double_quant=True,
         )
 
-    processor = AutoProcessor.from_pretrained(args.base_model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(resolved_base_model, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "left"
 
-    base_model = Qwen3_5ForConditionalGeneration.from_pretrained(args.base_model, **model_kwargs)
+    base_model = Qwen3_5ForConditionalGeneration.from_pretrained(resolved_base_model, **model_kwargs)
     model = PeftModel.from_pretrained(base_model, str(args.adapter_dir))
     model.eval()
 
@@ -89,7 +103,7 @@ def main() -> None:
     answer = processor.batch_decode(trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
 
     payload = {
-        "base_model": args.base_model,
+        "base_model": resolved_base_model,
         "adapter_dir": str(args.adapter_dir.resolve()),
         "dataset_jsonl": str(args.dataset_jsonl.resolve()),
         "sample_index": args.sample_index,

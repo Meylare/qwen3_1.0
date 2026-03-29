@@ -23,11 +23,12 @@ from reward_functions import smoke_reward_func
 
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "Qwen3.5-9B-Base"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run GSPO smoke training on Qwen3.5-9B-Base.")
-    parser.add_argument("--model_name", default="Qwen/Qwen3.5-9B-Base")
+    parser.add_argument("--model_name", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--train_dataset", type=Path, default=DEFAULT_DATA_DIR / "train.jsonl")
     parser.add_argument("--eval_dataset", type=Path, default=DEFAULT_DATA_DIR / "eval.jsonl")
     parser.add_argument("--output_dir", type=Path, default=Path(__file__).resolve().parent / "output" / "qwen35_9b_base_gspo_smoke")
@@ -58,6 +59,16 @@ def parse_args() -> argparse.Namespace:
 
 def ensure_output_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_model_path(model_name: str) -> str:
+    model_path = Path(model_name).expanduser()
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Local model path not found: {model_path}. "
+            f"Download the base model into {DEFAULT_MODEL_DIR} or pass --model_name explicitly."
+        )
+    return str(model_path.resolve())
 
 
 def _patch_instrumentation(GRPOTrainerCls):
@@ -140,6 +151,7 @@ def summarize_training(
     step_records: List[Dict[str, Any]],
     preprocess_metrics: Dict[str, Any],
     args: argparse.Namespace,
+    resolved_model_name: str,
     train_duration_sec: float,
 ) -> Dict[str, Any]:
     step_times = [row["step_sec"] for row in step_records]
@@ -165,7 +177,7 @@ def summarize_training(
         }
 
     return {
-        "model_name": args.model_name,
+        "model_name": resolved_model_name,
         "finetuning_mode": "qlora_4bit" if args.load_in_4bit else "lora_bf16",
         "max_steps": args.max_steps,
         "max_seq_length": args.max_seq_length,
@@ -185,6 +197,7 @@ def summarize_training(
 def main() -> None:
     args = parse_args()
     ensure_output_dir(args.output_dir)
+    resolved_model_name = resolve_model_path(args.model_name)
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
@@ -199,7 +212,7 @@ def main() -> None:
     InstrumentedGRPOTrainer = _patch_instrumentation(GRPOTrainer)
 
     model, processor = FastVisionModel.from_pretrained(
-        model_name=args.model_name,
+        model_name=resolved_model_name,
         max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
         load_in_16bit=not args.load_in_4bit,
@@ -300,6 +313,7 @@ def main() -> None:
         step_records=trainer._step_records,
         preprocess_metrics=preprocess_metrics,
         args=args,
+        resolved_model_name=resolved_model_name,
         train_duration_sec=train_duration_sec,
     )
     if probe_metrics:
