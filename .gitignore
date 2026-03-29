@@ -11,3 +11,4 @@ tests/
 model-train3/.venv4/
 output/
 *.bak
+model-train4/unsloth_compiled_cache
