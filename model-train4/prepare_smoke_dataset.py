@@ -25,8 +25,8 @@ import torch
 from prompting import build_prompt, deterministic_flip
 
 
-TRANSCRIPT_VERSION = "v2"
-AUDIO_SUMMARY_VERSION = "v4"
+TRANSCRIPT_VERSION = "v3"
+AUDIO_SUMMARY_VERSION = "v5"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "raw" / "train_fixed.jsonl"
 DEFAULT_VIDEO_DIR = PROJECT_ROOT / "data" / "raw" / "pair_vid"

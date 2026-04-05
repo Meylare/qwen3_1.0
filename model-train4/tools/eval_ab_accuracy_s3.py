@@ -792,6 +792,8 @@ def main() -> None:
         "whisper_model": args.whisper_model,
         "whisper_device": args.whisper_device,
         "speech_segmentation_mode": args.speech_segmentation_mode,
+        "music_genre_model": args.music_genre_model,
+        "music_genre_device": args.music_genre_device,
         "speech_min_segment_sec": args.speech_min_segment_sec,
         "speech_merge_gap_sec": args.speech_merge_gap_sec,
         "speech_keep_leading_trailing_pad_sec": args.speech_keep_leading_trailing_pad_sec,

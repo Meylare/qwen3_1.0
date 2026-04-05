@@ -15,9 +15,9 @@ CORE INSTRUCTIONS:
 1. MANDATORY VISUAL ANALYSIS: You must balance your analysis between the provided visual frames and the audio context. Observe transitions, on-screen text, facial expressions, editing rhythm, and lighting changes in the frames.
 2. AUDIO CONTEXT RULES: Each video may include a speech transcript, a separate song-lyrics transcript, and a short music summary. Treat these as different signals. Spoken words belong to the speech transcript. Sung words belong to the lyrics transcript.
 3. NO HALLUCINATED AUDIO CONTENT: If a video's speech transcript is empty, do not invent dialogue, quotes, brands, spoken claims, or narration. If the lyrics transcript is empty, do not invent lyrics. If the music summary says music was not detected, do not assume music is present.
-3. DATA-DRIVEN INSIGHTS: Avoid generic best practices. Instead, cite specific observations.
-4. LOGICAL CONSISTENCY: Your advice in <advice> must be a direct logical consequence of your findings in <think>.
-5. CONDITIONAL AUDIO ANALYSIS: Only analyze spoken hook, delivery, clarity, or dialogue when speech is present in the speech transcript. Only analyze song lyrics when lyrics are present in the lyrics transcript. Only analyze music genre or tempo when the music summary contains them.
+4. DATA-DRIVEN INSIGHTS: Avoid generic best practices. Instead, cite specific observations.
+5. LOGICAL CONSISTENCY: Your advice in <advice> must be a direct logical consequence of your findings in <think>.
+6. CONDITIONAL AUDIO ANALYSIS: Only analyze spoken hook, delivery, clarity, or dialogue when speech is present in the speech transcript. Only analyze song lyrics when lyrics are present in the lyrics transcript. Only analyze music genre or tempo when the music summary contains them.
 
 OUTPUT STRUCTURE:
 <think>
@@ -59,7 +59,15 @@ def deterministic_flip(item: Dict[str, Any], idx: int) -> Dict[str, Any]:
         flipped["video_a"], flipped["video_b"] = item["video_b"], item["video_a"]
         flipped["views_a"], flipped["views_b"] = item["views_b"], item["views_a"]
         flipped["transcript_a"], flipped["transcript_b"] = item["transcript_b"], item["transcript_a"]
+        flipped["transcript_segments_a"], flipped["transcript_segments_b"] = (
+            item.get("transcript_segments_b", []),
+            item.get("transcript_segments_a", []),
+        )
         flipped["lyrics_a"], flipped["lyrics_b"] = item.get("lyrics_b", ""), item.get("lyrics_a", "")
+        flipped["lyrics_segments_a"], flipped["lyrics_segments_b"] = (
+            item.get("lyrics_segments_b", []),
+            item.get("lyrics_segments_a", []),
+        )
         flipped["audio_summary_a"], flipped["audio_summary_b"] = item["audio_summary_b"], item["audio_summary_a"]
     return flipped
 
@@ -102,8 +110,8 @@ def build_user_text(item: Dict[str, Any]) -> str:
         "3. In <advice> tags, write a friendly and professional response addressed to the creator of the "
         "losing video. Explain what their video lacked compared to the winner and provide 3 actionable, "
         "data-driven tips for improvement.\n\n"
-        "CRITICAL: The text inside <advice> must be in the SAME language as the video's transcript or the "
-        "user's input. If the video is in Russian, write advice in Russian. If it's English, write in English."
+        "CRITICAL: The text inside <advice> must be in the SAME language as the losing video's speech transcript, "
+        "lyrics transcript, or creator context. If the video is in Russian, write advice in Russian. If it's English, write in English."
     )
 
 
