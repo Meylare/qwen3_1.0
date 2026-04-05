@@ -26,11 +26,15 @@ from prompting import build_prompt, deterministic_flip
 
 
 TRANSCRIPT_VERSION = "v2"
-AUDIO_SUMMARY_VERSION = "v3"
+AUDIO_SUMMARY_VERSION = "v4"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "raw" / "train_fixed.jsonl"
 DEFAULT_VIDEO_DIR = PROJECT_ROOT / "data" / "raw" / "pair_vid"
 SEGMENTER_INSTANCE: Any | None = None
+DEFAULT_MUSIC_GENRE_MODEL = "dima806/music_genres_classification"
+MUSIC_GENRE_EXTRACTOR: Any | None = None
+MUSIC_GENRE_MODEL_INSTANCE: Any | None = None
+MUSIC_GENRE_MODEL_KEY: Tuple[str, str] | None = None
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -141,95 +145,43 @@ def get_segment_text(seg: Any) -> str:
         return str(seg.get("text", "") or "")
     return str(getattr(seg, "text", "") or "")
 
-
-def describe_level(value: float, low: float, high: float, labels: Tuple[str, str, str]) -> str:
-    if value < low:
-        return labels[0]
-    if value < high:
-        return labels[1]
-    return labels[2]
-
-
-def estimate_speech_seconds_from_transcript(transcript_segments: Iterable[Any]) -> float:
-    speech_seconds = 0.0
-    for seg in transcript_segments:
-        start = max(0.0, get_segment_start(seg))
-        end = max(start, get_segment_end(seg))
-        speech_seconds += max(0.0, end - start)
-    return speech_seconds
-
-
-def build_audio_summary(
-    wav_path: Path,
-    transcript_text: str,
-    transcript_segments: Iterable[Any],
-    detected_language: Optional[str],
+def build_music_summary(
+    music_wav_path: Optional[Path],
     segmentation_info: Optional[Dict[str, Any]] = None,
-    transcript_source: str = "full_audio",
+    music_genre_model: str = DEFAULT_MUSIC_GENRE_MODEL,
+    music_genre_device: str = "cpu",
 ) -> str:
-    y, sr = librosa.load(str(wav_path), sr=16000, mono=True)
+    if music_wav_path is None or not music_wav_path.exists():
+        return "Music not detected."
+
+    y, sr = librosa.load(str(music_wav_path), sr=16000, mono=True)
     if y.size == 0:
-        return "No usable audio was extracted from the clip."
+        return "Music not detected."
 
-    duration = len(y) / sr
     hop_length = 512
-
-    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-    rms_db = librosa.amplitude_to_db(np.maximum(rms, 1e-10), ref=1.0)
-    spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-    zero_crossings = librosa.feature.zero_crossing_rate(y, hop_length=hop_length)[0]
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
     tempo_arr = librosa.feature.tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
     tempo = float(tempo_arr[0]) if np.size(tempo_arr) else 0.0
-
-    silence_threshold = float(np.percentile(rms, 25)) if rms.size else 0.0
-    silence_ratio = float(np.mean(rms <= silence_threshold)) if rms.size else 0.0
-    dynamic_range_db = float(np.percentile(rms_db, 95) - np.percentile(rms_db, 5)) if rms_db.size else 0.0
-    loudness_db = float(np.mean(rms_db)) if rms_db.size else -80.0
-    centroid_hz = float(np.mean(spectral_centroid)) if spectral_centroid.size else 0.0
-    zcr = float(np.mean(zero_crossings)) if zero_crossings.size else 0.0
-
-    speech_seconds = (
-        float(segmentation_info.get("speech_sec", 0.0) or 0.0)
-        if segmentation_info is not None
-        else estimate_speech_seconds_from_transcript(transcript_segments)
+    genre_label, genre_confidence = classify_music_genre(
+        wav_path=music_wav_path,
+        model_name=music_genre_model,
+        device=music_genre_device,
     )
-    speech_ratio = min(1.0, speech_seconds / duration) if duration > 0 else 0.0
-    speech_profile = describe_level(
-        speech_ratio,
-        0.2,
-        0.6,
-        ("music/noise-heavy", "mixed speech-and-sound", "speech-dominant"),
-    )
-    rhythm_profile = describe_level(tempo, 80.0, 130.0, ("slow", "moderate", "fast"))
-    energy_profile = describe_level(loudness_db, -28.0, -18.0, ("low-energy", "medium-energy", "high-energy"))
-    brightness_profile = describe_level(centroid_hz, 1200.0, 2600.0, ("warm/dark", "balanced", "bright"))
 
-    language_text = detected_language or "unknown"
-    extra_parts: List[str] = []
-    if segmentation_info is not None:
-        extra_parts.append(
-            f"Transcript derived from {transcript_source.replace('_', '-')}. "
-            f"inaSpeech breakdown: speech={float(segmentation_info.get('speech_sec', 0.0) or 0.0):.1f}s, "
-            f"music={float(segmentation_info.get('music_sec', 0.0) or 0.0):.1f}s, "
-            f"noise={float(segmentation_info.get('noise_sec', 0.0) or 0.0):.1f}s, "
-            f"speech segments={int(segmentation_info.get('num_speech_segments', 0) or 0)}."
-        )
-        if speech_seconds <= 0:
-            extra_parts.append("Author speech was not detected after segmentation.")
+    parts = []
+    if genre_label:
+        if genre_confidence is not None:
+            parts.append(f"Music genre: {genre_label} ({genre_confidence:.2f} confidence).")
+        else:
+            parts.append(f"Music genre: {genre_label}.")
+    else:
+        parts.append("Music genre: unknown.")
 
-    return (
-        f"Detected language: {language_text}. "
-        f"Soundtrack class: {speech_profile}. "
-        f"Rhythm: {rhythm_profile} at ~{tempo:.0f} BPM. "
-        f"Loudness: {loudness_db:.1f} dBFS. "
-        f"Dynamic range: {dynamic_range_db:.1f} dB. "
-        f"Energy feel: {energy_profile}. "
-        f"Silence ratio: {silence_ratio:.2f}. "
-        f"Spectral brightness is {brightness_profile} "
-        f"(centroid {centroid_hz:.0f} Hz, zero-crossing rate {zcr:.3f})."
-        + (f" {' '.join(extra_parts)}" if extra_parts else "")
-    )
+    if tempo > 0:
+        parts.append(f"Music tempo: ~{tempo:.0f} BPM.")
+    else:
+        parts.append("Music tempo: unknown.")
+    return " ".join(parts)
 
 
 def get_cache_key(video_path: Path, max_duration: float, whisper_model: str) -> str:
@@ -255,6 +207,7 @@ def get_cache_key_with_segmentation(
     speech_merge_gap_sec: float,
     speech_keep_leading_trailing_pad_sec: float,
     segmentation_fallback_to_full_audio: bool,
+    music_genre_model: str,
 ) -> str:
     stat = video_path.stat()
     signature = {
@@ -270,6 +223,7 @@ def get_cache_key_with_segmentation(
         "speech_merge_gap_sec": speech_merge_gap_sec,
         "speech_keep_leading_trailing_pad_sec": speech_keep_leading_trailing_pad_sec,
         "segmentation_fallback_to_full_audio": segmentation_fallback_to_full_audio,
+        "music_genre_model": music_genre_model,
     }
     return sha1_text(json.dumps(signature, sort_keys=True))
 
@@ -292,6 +246,47 @@ def is_inaspeech_speech_label(label: str) -> bool:
 def is_inaspeech_music_label(label: str) -> bool:
     normalized = (label or "").strip().lower()
     return "music" in normalized
+
+
+def postprocess_labeled_segments(
+    segments: List[Dict[str, Any]],
+    total_duration_sec: float,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+    keep_pad_sec: float,
+    label_predicate,
+    output_label: str,
+) -> List[Dict[str, Any]]:
+    filtered_segments: List[Dict[str, Any]] = []
+    for seg in segments:
+        if not label_predicate(str(seg.get("label", ""))):
+            continue
+        start = max(0.0, float(seg["start_sec"]) - keep_pad_sec)
+        end = min(total_duration_sec, float(seg["end_sec"]) + keep_pad_sec)
+        if end - start < min_segment_sec:
+            continue
+        filtered_segments.append(
+            {
+                "label": output_label,
+                "start_sec": start,
+                "end_sec": end,
+                "duration_sec": max(0.0, end - start),
+            }
+        )
+
+    if not filtered_segments:
+        return []
+
+    filtered_segments.sort(key=lambda x: x["start_sec"])
+    merged = [filtered_segments[0].copy()]
+    for seg in filtered_segments[1:]:
+        prev = merged[-1]
+        if float(seg["start_sec"]) - float(prev["end_sec"]) <= merge_gap_sec:
+            prev["end_sec"] = max(float(prev["end_sec"]), float(seg["end_sec"]))
+            prev["duration_sec"] = max(0.0, float(prev["end_sec"]) - float(prev["start_sec"]))
+        else:
+            merged.append(seg.copy())
+    return merged
 
 
 def segment_audio_with_inaspeech(wav_path: Path) -> List[Dict[str, Any]]:
@@ -322,40 +317,36 @@ def postprocess_speech_segments(
     merge_gap_sec: float,
     keep_pad_sec: float,
 ) -> List[Dict[str, Any]]:
-    speech_segments: List[Dict[str, Any]] = []
-    for seg in segments:
-        if not is_inaspeech_speech_label(str(seg.get("label", ""))):
-            continue
-        start = max(0.0, float(seg["start_sec"]) - keep_pad_sec)
-        end = min(total_duration_sec, float(seg["end_sec"]) + keep_pad_sec)
-        if end - start < min_segment_sec:
-            continue
-        speech_segments.append(
-            {
-                "label": "speech",
-                "start_sec": start,
-                "end_sec": end,
-                "duration_sec": max(0.0, end - start),
-            }
-        )
-
-    if not speech_segments:
-        return []
-
-    speech_segments.sort(key=lambda x: x["start_sec"])
-    merged = [speech_segments[0].copy()]
-    for seg in speech_segments[1:]:
-        prev = merged[-1]
-        if float(seg["start_sec"]) - float(prev["end_sec"]) <= merge_gap_sec:
-            prev["end_sec"] = max(float(prev["end_sec"]), float(seg["end_sec"]))
-            prev["duration_sec"] = max(0.0, float(prev["end_sec"]) - float(prev["start_sec"]))
-        else:
-            merged.append(seg.copy())
-    return merged
+    return postprocess_labeled_segments(
+        segments=segments,
+        total_duration_sec=total_duration_sec,
+        min_segment_sec=min_segment_sec,
+        merge_gap_sec=merge_gap_sec,
+        keep_pad_sec=keep_pad_sec,
+        label_predicate=is_inaspeech_speech_label,
+        output_label="speech",
+    )
 
 
-def render_speech_only_wav(src_wav: Path, speech_segments: List[Dict[str, Any]], dst_wav: Path) -> Tuple[List[Dict[str, float]], float]:
-    if not speech_segments:
+def postprocess_music_segments(
+    segments: List[Dict[str, Any]],
+    total_duration_sec: float,
+    min_segment_sec: float = 1.0,
+    merge_gap_sec: float = 0.5,
+) -> List[Dict[str, Any]]:
+    return postprocess_labeled_segments(
+        segments=segments,
+        total_duration_sec=total_duration_sec,
+        min_segment_sec=min_segment_sec,
+        merge_gap_sec=merge_gap_sec,
+        keep_pad_sec=0.0,
+        label_predicate=is_inaspeech_music_label,
+        output_label="music",
+    )
+
+
+def render_segments_wav(src_wav: Path, segments: List[Dict[str, Any]], dst_wav: Path) -> Tuple[List[Dict[str, float]], float]:
+    if not segments:
         return [], 0.0
 
     with wave.open(str(src_wav), "rb") as reader:
@@ -373,7 +364,7 @@ def render_speech_only_wav(src_wav: Path, speech_segments: List[Dict[str, Any]],
     mapping: List[Dict[str, float]] = []
     cursor_sec = 0.0
 
-    for seg in speech_segments:
+    for seg in segments:
         orig_start = max(0.0, float(seg["start_sec"]))
         orig_end = max(orig_start, float(seg["end_sec"]))
         start_idx = min(len(pcm), int(round(orig_start * framerate)))
@@ -404,6 +395,10 @@ def render_speech_only_wav(src_wav: Path, speech_segments: List[Dict[str, Any]],
         writer.writeframes(out.astype(np.int16).tobytes())
 
     return mapping, len(out) / float(framerate)
+
+
+def render_speech_only_wav(src_wav: Path, speech_segments: List[Dict[str, Any]], dst_wav: Path) -> Tuple[List[Dict[str, float]], float]:
+    return render_segments_wav(src_wav=src_wav, segments=speech_segments, dst_wav=dst_wav)
 
 
 def remap_time_to_original(value: float, mapping_table: List[Dict[str, float]]) -> float:
@@ -466,17 +461,97 @@ def build_whisper_model(model_name: str, device: str, compute_type: str):
     return WhisperModel(model_name, device=device, compute_type=compute_type)
 
 
+def build_music_genre_classifier(model_name: str, device: str):
+    global MUSIC_GENRE_EXTRACTOR, MUSIC_GENRE_MODEL_INSTANCE, MUSIC_GENRE_MODEL_KEY
+
+    model_key = (model_name, device)
+    if MUSIC_GENRE_MODEL_INSTANCE is not None and MUSIC_GENRE_EXTRACTOR is not None and MUSIC_GENRE_MODEL_KEY == model_key:
+        return MUSIC_GENRE_EXTRACTOR, MUSIC_GENRE_MODEL_INSTANCE
+
+    from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+
+    extractor = AutoFeatureExtractor.from_pretrained(model_name)
+    model = AutoModelForAudioClassification.from_pretrained(model_name)
+    torch_device = torch.device(device if str(device).startswith("cuda") and torch.cuda.is_available() else "cpu")
+    model.to(torch_device)
+    model.eval()
+
+    MUSIC_GENRE_EXTRACTOR = extractor
+    MUSIC_GENRE_MODEL_INSTANCE = model
+    MUSIC_GENRE_MODEL_KEY = model_key
+    return extractor, model
+
+
+def classify_music_genre(wav_path: Path, model_name: str, device: str) -> Tuple[Optional[str], Optional[float]]:
+    try:
+        extractor, model = build_music_genre_classifier(model_name, device)
+    except Exception:
+        return None, None
+
+    sampling_rate = int(getattr(extractor, "sampling_rate", 16000) or 16000)
+    y, _ = librosa.load(str(wav_path), sr=sampling_rate, mono=True)
+    if y.size == 0:
+        return None, None
+
+    max_seconds = 30
+    max_samples = sampling_rate * max_seconds
+    if len(y) > max_samples:
+        y = y[:max_samples]
+
+    inputs = extractor(y, sampling_rate=sampling_rate, return_tensors="pt")
+    model_inputs = {
+        key: value.to(model.device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
+    }
+    with torch.no_grad():
+        logits = model(**model_inputs).logits[0]
+        probs = torch.softmax(logits, dim=-1)
+        best_idx = int(torch.argmax(probs).item())
+        confidence = float(probs[best_idx].item())
+
+    label = model.config.id2label.get(best_idx)
+    return (str(label).strip().lower() if label is not None else None, confidence)
+
+
+def transcribe_audio_path(
+    whisper_model,
+    wav_path: Path,
+    vad_filter: bool,
+    mapping_table: Optional[List[Dict[str, float]]] = None,
+) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    segments, info = whisper_model.transcribe(
+        str(wav_path),
+        word_timestamps=False,
+        vad_filter=vad_filter,
+    )
+    raw_segments = list(segments)
+    if mapping_table:
+        segment_list = remap_whisper_segments_to_original(raw_segments, mapping_table)
+    else:
+        segment_list = [
+            {
+                "start": round(get_segment_start(seg), 4),
+                "end": round(get_segment_end(seg), 4),
+                "text": get_segment_text(seg),
+            }
+            for seg in raw_segments
+        ]
+    return format_transcript(segment_list), segment_list, getattr(info, "language", None)
+
+
 def extract_video_side_info(
     video_path: Path,
     cache_dir: Path,
     max_duration: float,
     whisper_model_name: str,
     whisper_model,
-    speech_segmentation_mode: str = "off",
+    speech_segmentation_mode: str = "inaspeech",
     speech_min_segment_sec: float = 0.35,
     speech_merge_gap_sec: float = 0.25,
     speech_keep_leading_trailing_pad_sec: float = 0.10,
     segmentation_fallback_to_full_audio: bool = True,
+    music_genre_model: str = DEFAULT_MUSIC_GENRE_MODEL,
+    music_genre_device: str = "cpu",
 ) -> Dict[str, Any]:
     cache_key = get_cache_key_with_segmentation(
         video_path=video_path,
@@ -487,6 +562,7 @@ def extract_video_side_info(
         speech_merge_gap_sec=speech_merge_gap_sec,
         speech_keep_leading_trailing_pad_sec=speech_keep_leading_trailing_pad_sec,
         segmentation_fallback_to_full_audio=segmentation_fallback_to_full_audio,
+        music_genre_model=music_genre_model,
     )
     cache_path = cache_dir / f"{cache_key}.json"
     cached = maybe_load_cache(cache_path)
@@ -501,8 +577,11 @@ def extract_video_side_info(
             "video_path": str(video_path.resolve()),
             "transcript": "",
             "transcript_segments": [],
-            "audio_summary": "No audio stream detected in the clip.",
+            "lyrics_transcript": "",
+            "lyrics_transcript_segments": [],
+            "audio_summary": "Music not detected.",
             "detected_language": None,
+            "lyrics_detected_language": None,
             "speech_segmentation_mode": speech_segmentation_mode,
             "segmentation_applied": False,
             "segmentation_fallback": False,
@@ -514,10 +593,12 @@ def extract_video_side_info(
             "segmentation_speech_ratio": 0.0,
             "segmentation_num_speech_segments": 0,
             "speech_only_audio_sec": 0.0,
+            "music_only_audio_sec": 0.0,
             "segmentation_summary": "No audio stream detected in the clip.",
             "segmentation_sec": 0.0,
             "audio_extract_sec": 0.0,
             "transcription_sec": 0.0,
+            "lyrics_transcription_sec": 0.0,
             "audio_summary_sec": 0.0,
             "total_sec": round(time.perf_counter() - total_start, 4),
             "cache_hit": False,
@@ -528,6 +609,7 @@ def extract_video_side_info(
     with tempfile.TemporaryDirectory(prefix="qwen35_audio_") as tmpdir:
         wav_path = Path(tmpdir) / "audio.wav"
         speech_only_wav_path = Path(tmpdir) / "speech_only.wav"
+        music_only_wav_path = Path(tmpdir) / "music_only.wav"
 
         audio_start = time.perf_counter()
         ffmpeg_extract_audio(video_path, wav_path, max_duration=max_duration)
@@ -540,8 +622,12 @@ def extract_video_side_info(
         transcript_source = "full_audio"
         segmentation_sec = 0.0
         speech_only_audio_sec = 0.0
+        music_only_audio_sec = 0.0
         segmentation_summary = ""
         transcript_segments_for_summary: List[Any] = []
+        lyrics_segment_list: List[Dict[str, Any]] = []
+        lyrics_text = ""
+        lyrics_detected_language: Optional[str] = None
         segmentation_info = {
             "mode": speech_segmentation_mode,
             "total_audio_sec": round(total_audio_sec, 4),
@@ -552,7 +638,9 @@ def extract_video_side_info(
             "num_speech_segments": 0,
         }
         transcription_target_wav = wav_path
-        mapping_table: List[Dict[str, float]] = []
+        speech_mapping_table: List[Dict[str, float]] = []
+        music_mapping_table: List[Dict[str, float]] = []
+        music_summary = "Music not detected."
 
         if speech_segmentation_mode == "inaspeech":
             seg_start = time.perf_counter()
@@ -565,6 +653,10 @@ def extract_video_side_info(
                     merge_gap_sec=speech_merge_gap_sec,
                     keep_pad_sec=speech_keep_leading_trailing_pad_sec,
                 )
+                processed_music_segments = postprocess_music_segments(
+                    raw_segments,
+                    total_duration_sec=total_audio_sec,
+                )
                 label_durations = {"speech": 0.0, "music": 0.0, "noise": 0.0}
                 for seg in raw_segments:
                     label = str(seg.get("label", "")).lower()
@@ -576,10 +668,15 @@ def extract_video_side_info(
                     else:
                         label_durations["noise"] += duration
 
-                mapping_table, speech_only_audio_sec = render_speech_only_wav(
+                speech_mapping_table, speech_only_audio_sec = render_speech_only_wav(
                     src_wav=wav_path,
                     speech_segments=processed_speech_segments,
                     dst_wav=speech_only_wav_path,
+                )
+                music_mapping_table, music_only_audio_sec = render_segments_wav(
+                    src_wav=wav_path,
+                    segments=processed_music_segments,
+                    dst_wav=music_only_wav_path,
                 )
                 segmentation_info = {
                     "mode": speech_segmentation_mode,
@@ -618,31 +715,37 @@ def extract_video_side_info(
             transcript_text = ""
             transcription_sec = time.perf_counter() - transcribe_start
         else:
-            segments, info = whisper_model.transcribe(str(transcription_target_wav), word_timestamps=False, vad_filter=True)
-            segment_list_raw = list(segments)
-            if transcript_source == "speech_only" and mapping_table:
-                segment_list = remap_whisper_segments_to_original(segment_list_raw, mapping_table)
-            else:
-                segment_list = [
-                    {
-                        "start": round(get_segment_start(seg), 4),
-                        "end": round(get_segment_end(seg), 4),
-                        "text": get_segment_text(seg),
-                    }
-                    for seg in segment_list_raw
-                ]
-            transcript_text = format_transcript(segment_list)
+            transcript_text, segment_list, detected_language = transcribe_audio_path(
+                whisper_model=whisper_model,
+                wav_path=transcription_target_wav,
+                vad_filter=True,
+                mapping_table=speech_mapping_table if transcript_source == "speech_only" else None,
+            )
+            info = type("WhisperInfo", (), {"language": detected_language})()
             transcription_sec = time.perf_counter() - transcribe_start
         transcript_segments_for_summary = segment_list
 
+        lyrics_start = time.perf_counter()
+        if (
+            speech_segmentation_mode == "inaspeech"
+            and not segmentation_fallback
+            and music_only_audio_sec > 0
+            and music_only_wav_path.exists()
+        ):
+            lyrics_text, lyrics_segment_list, lyrics_detected_language = transcribe_audio_path(
+                whisper_model=whisper_model,
+                wav_path=music_only_wav_path,
+                vad_filter=False,
+                mapping_table=music_mapping_table,
+            )
+        lyrics_transcription_sec = time.perf_counter() - lyrics_start
+
         summary_start = time.perf_counter()
-        audio_summary = build_audio_summary(
-            wav_path=wav_path,
-            transcript_text=transcript_text,
-            transcript_segments=transcript_segments_for_summary,
-            detected_language=getattr(info, "language", None),
+        audio_summary = build_music_summary(
+            music_wav_path=music_only_wav_path if music_only_audio_sec > 0 and music_only_wav_path.exists() else None,
             segmentation_info=segmentation_info if segmentation_applied else None,
-            transcript_source=transcript_source,
+            music_genre_model=music_genre_model,
+            music_genre_device=music_genre_device,
         )
         audio_summary_sec = time.perf_counter() - summary_start
 
@@ -650,8 +753,11 @@ def extract_video_side_info(
         "video_path": str(video_path.resolve()),
         "transcript": transcript_text,
         "transcript_segments": transcript_segments_for_summary,
+        "lyrics_transcript": lyrics_text,
+        "lyrics_transcript_segments": lyrics_segment_list,
         "audio_summary": audio_summary,
         "detected_language": getattr(info, "language", None),
+        "lyrics_detected_language": lyrics_detected_language,
         "speech_segmentation_mode": speech_segmentation_mode,
         "segmentation_applied": segmentation_applied,
         "segmentation_fallback": segmentation_fallback,
@@ -663,10 +769,12 @@ def extract_video_side_info(
         "segmentation_speech_ratio": round(float(segmentation_info.get("speech_ratio", 0.0) or 0.0), 4),
         "segmentation_num_speech_segments": int(segmentation_info.get("num_speech_segments", 0) or 0),
         "speech_only_audio_sec": round(float(speech_only_audio_sec), 4),
+        "music_only_audio_sec": round(float(music_only_audio_sec), 4),
         "segmentation_summary": segmentation_summary,
         "segmentation_sec": round(segmentation_sec, 4),
         "audio_extract_sec": round(audio_extract_sec, 4),
         "transcription_sec": round(transcription_sec, 4),
+        "lyrics_transcription_sec": round(lyrics_transcription_sec, 4),
         "audio_summary_sec": round(audio_summary_sec, 4),
         "total_sec": round(time.perf_counter() - total_start, 4),
         "cache_hit": False,
@@ -723,6 +831,10 @@ def convert_rows(
                 "transcript_b": item.get("transcript_b", ""),
                 "transcript_segments_a": item.get("transcript_segments_a", []),
                 "transcript_segments_b": item.get("transcript_segments_b", []),
+                "lyrics_a": item.get("lyrics_a", ""),
+                "lyrics_b": item.get("lyrics_b", ""),
+                "lyrics_segments_a": item.get("lyrics_segments_a", []),
+                "lyrics_segments_b": item.get("lyrics_segments_b", []),
                 "audio_summary_a": item.get("audio_summary_a", ""),
                 "audio_summary_b": item.get("audio_summary_b", ""),
             }
@@ -751,12 +863,14 @@ def main() -> None:
     parser.add_argument("--whisper_model", default="large-v3")
     parser.add_argument("--whisper_device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--whisper_compute_type", default=None)
-    parser.add_argument("--speech_segmentation_mode", choices=("off", "inaspeech"), default="off")
+    parser.add_argument("--speech_segmentation_mode", choices=("off", "inaspeech"), default="inaspeech")
     parser.add_argument("--speech_min_segment_sec", type=float, default=0.35)
     parser.add_argument("--speech_merge_gap_sec", type=float, default=0.25)
     parser.add_argument("--speech_keep_leading_trailing_pad_sec", type=float, default=0.10)
     parser.add_argument("--segmentation_fallback_to_full_audio", action="store_true", default=True)
     parser.add_argument("--no_segmentation_fallback_to_full_audio", action="store_false", dest="segmentation_fallback_to_full_audio")
+    parser.add_argument("--music_genre_model", default=DEFAULT_MUSIC_GENRE_MODEL)
+    parser.add_argument("--music_genre_device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -801,6 +915,8 @@ def main() -> None:
             speech_merge_gap_sec=args.speech_merge_gap_sec,
             speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
             segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+            music_genre_model=args.music_genre_model,
+            music_genre_device=args.music_genre_device,
         )
         meta_b = extract_video_side_info(
             video_path=video_b,
@@ -813,6 +929,8 @@ def main() -> None:
             speech_merge_gap_sec=args.speech_merge_gap_sec,
             speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
             segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+            music_genre_model=args.music_genre_model,
+            music_genre_device=args.music_genre_device,
         )
         cache_hits += int(meta_a.get("cache_hit", False)) + int(meta_b.get("cache_hit", False))
         video_timings.extend([meta_a["total_sec"], meta_b["total_sec"]])
@@ -829,6 +947,10 @@ def main() -> None:
         enriched["transcript_b"] = meta_b["transcript"]
         enriched["transcript_segments_a"] = meta_a.get("transcript_segments", [])
         enriched["transcript_segments_b"] = meta_b.get("transcript_segments", [])
+        enriched["lyrics_a"] = meta_a.get("lyrics_transcript", "")
+        enriched["lyrics_b"] = meta_b.get("lyrics_transcript", "")
+        enriched["lyrics_segments_a"] = meta_a.get("lyrics_transcript_segments", [])
+        enriched["lyrics_segments_b"] = meta_b.get("lyrics_transcript_segments", [])
         enriched["audio_summary_a"] = meta_a["audio_summary"]
         enriched["audio_summary_b"] = meta_b["audio_summary"]
         processed_rows.append(enriched)
@@ -864,6 +986,8 @@ def main() -> None:
         "whisper_device": args.whisper_device,
         "whisper_compute_type": compute_type,
         "speech_segmentation_mode": args.speech_segmentation_mode,
+        "music_genre_model": args.music_genre_model,
+        "music_genre_device": args.music_genre_device,
         "speech_min_segment_sec": args.speech_min_segment_sec,
         "speech_merge_gap_sec": args.speech_merge_gap_sec,
         "speech_keep_leading_trailing_pad_sec": args.speech_keep_leading_trailing_pad_sec,

@@ -25,8 +25,6 @@ THINK_PREFILL_RE = re.compile(r"^(.*?)</think>", re.DOTALL | re.IGNORECASE)
 ADVICE_RE = re.compile(r"<advice>(.*?)</advice>", re.DOTALL | re.IGNORECASE)
 LANG_RE = re.compile(r"detected language:\s*([a-z]{2,3}(?:-[a-z]{2,3})?)", re.IGNORECASE)
 CREATOR_CONTEXT_RE = re.compile(r"creator context:\s*(.*?)\n\s*video a metadata:", re.IGNORECASE | re.DOTALL)
-SPEECH_COVERAGE_RE = re.compile(r"speech coverage is about\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
-TRANSCRIPT_LENGTH_RE = re.compile(r"transcript length:\s*(\d+)\s+words", re.IGNORECASE)
 SEGMENTATION_SPEECH_RE = re.compile(
     r"(?:segmentation found|inaspeech breakdown:)\s*speech=\s*([0-9]*\.?[0-9]+)s",
     re.IGNORECASE,
@@ -223,28 +221,10 @@ def is_music_only_case(audio_summary: Any, transcript: Any) -> bool:
         except ValueError:
             pass
 
-    coverage_match = SPEECH_COVERAGE_RE.search(summary)
-    if coverage_match:
-        try:
-            coverage = float(coverage_match.group(1))
-            if coverage <= 0.01 and not transcript_text:
-                return True
-        except ValueError:
-            pass
-
-    transcript_len_match = TRANSCRIPT_LENGTH_RE.search(summary)
-    if transcript_len_match:
-        try:
-            transcript_len = int(transcript_len_match.group(1))
-            if transcript_len == 0 and not transcript_text:
-                return True
-        except ValueError:
-            pass
-
     lowered = summary.lower()
     if "author speech was not detected after segmentation" in lowered and not transcript_text:
         return True
-    if "soundtrack class: music/noise-heavy" in lowered and not transcript_text:
+    if "music not detected" not in lowered and not transcript_text:
         return True
     return False
 
@@ -281,20 +261,25 @@ def determine_target_language(
     prompt: Any = None,
     transcript_a: Any = None,
     transcript_b: Any = None,
+    lyrics_a: Any = None,
+    lyrics_b: Any = None,
     audio_summary_a: Any = None,
     audio_summary_b: Any = None,
 ) -> Optional[str]:
     loser_label = "B" if gt == "A" else "A"
-    loser_audio_summary = audio_summary_b if loser_label == "B" else audio_summary_a
     loser_transcript = transcript_b if loser_label == "B" else transcript_a
-    music_only = is_music_only_case(loser_audio_summary, loser_transcript)
-
-    if not music_only:
-        lang = extract_language_from_audio_summary(loser_audio_summary)
-        if lang:
-            return lang
+    loser_lyrics = lyrics_b if loser_label == "B" else lyrics_a
 
     lang = detect_language(loser_transcript)
+    if lang:
+        return lang
+
+    lang = detect_language(loser_lyrics)
+    if lang:
+        return lang
+
+    loser_audio_summary = audio_summary_b if loser_label == "B" else audio_summary_a
+    lang = extract_language_from_audio_summary(loser_audio_summary)
     if lang:
         return lang
 
@@ -405,6 +390,8 @@ def build_reward_debug_entry(completion: Any, gt: str, **context: Any) -> Dict[s
         prompt=context.get("prompt"),
         transcript_a=context.get("transcript_a"),
         transcript_b=context.get("transcript_b"),
+        lyrics_a=context.get("lyrics_a"),
+        lyrics_b=context.get("lyrics_b"),
         audio_summary_a=context.get("audio_summary_a"),
         audio_summary_b=context.get("audio_summary_b"),
     )
@@ -457,6 +444,8 @@ def build_reward_debug_batch(completions: List[str], label: List[str], **kwargs:
             "prompt": _value_at(kwargs.get("prompt"), idx),
             "transcript_a": _value_at(kwargs.get("transcript_a"), idx),
             "transcript_b": _value_at(kwargs.get("transcript_b"), idx),
+            "lyrics_a": _value_at(kwargs.get("lyrics_a"), idx),
+            "lyrics_b": _value_at(kwargs.get("lyrics_b"), idx),
             "audio_summary_a": _value_at(kwargs.get("audio_summary_a"), idx),
             "audio_summary_b": _value_at(kwargs.get("audio_summary_b"), idx),
             "max_completion_length": _value_at(kwargs.get("max_completion_length"), idx),

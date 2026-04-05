@@ -40,12 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--whisper_model', default='large-v3')
     parser.add_argument('--whisper_device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--whisper_compute_type', default=None)
-    parser.add_argument('--speech_segmentation_mode', choices=('off', 'inaspeech'), default='off')
+    parser.add_argument('--speech_segmentation_mode', choices=('off', 'inaspeech'), default='inaspeech')
     parser.add_argument('--speech_min_segment_sec', type=float, default=0.35)
     parser.add_argument('--speech_merge_gap_sec', type=float, default=0.25)
     parser.add_argument('--speech_keep_leading_trailing_pad_sec', type=float, default=0.10)
     parser.add_argument('--segmentation_fallback_to_full_audio', action='store_true', default=True)
     parser.add_argument('--no_segmentation_fallback_to_full_audio', action='store_false', dest='segmentation_fallback_to_full_audio')
+    parser.add_argument('--music_genre_model', default='dima806/music_genres_classification')
+    parser.add_argument('--music_genre_device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--skip_bad_pairs', action='store_true', default=True)
     parser.add_argument('--no_skip_bad_pairs', action='store_false', dest='skip_bad_pairs')
     parser.add_argument('--aws_profile', default=None)
@@ -100,6 +102,8 @@ def main() -> None:
                 speech_merge_gap_sec=args.speech_merge_gap_sec,
                 speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
                 segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+                music_genre_model=args.music_genre_model,
+                music_genre_device=args.music_genre_device,
             )
             meta_b = extract_video_side_info(
                 video_path=local_b,
@@ -112,6 +116,8 @@ def main() -> None:
                 speech_merge_gap_sec=args.speech_merge_gap_sec,
                 speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
                 segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+                music_genre_model=args.music_genre_model,
+                music_genre_device=args.music_genre_device,
             )
         except Exception as exc:
             if not args.skip_bad_pairs:
@@ -150,6 +156,10 @@ def main() -> None:
         enriched['transcript_b'] = meta_b['transcript']
         enriched['transcript_segments_a'] = meta_a.get('transcript_segments', [])
         enriched['transcript_segments_b'] = meta_b.get('transcript_segments', [])
+        enriched['lyrics_a'] = meta_a.get('lyrics_transcript', '')
+        enriched['lyrics_b'] = meta_b.get('lyrics_transcript', '')
+        enriched['lyrics_segments_a'] = meta_a.get('lyrics_transcript_segments', [])
+        enriched['lyrics_segments_b'] = meta_b.get('lyrics_transcript_segments', [])
         enriched['audio_summary_a'] = meta_a['audio_summary']
         enriched['audio_summary_b'] = meta_b['audio_summary']
         processed_rows.append(enriched)
@@ -187,6 +197,8 @@ def main() -> None:
         'whisper_device': args.whisper_device,
         'whisper_compute_type': compute_type,
         'speech_segmentation_mode': args.speech_segmentation_mode,
+        'music_genre_model': args.music_genre_model,
+        'music_genre_device': args.music_genre_device,
         'speech_min_segment_sec': args.speech_min_segment_sec,
         'speech_merge_gap_sec': args.speech_merge_gap_sec,
         'speech_keep_leading_trailing_pad_sec': args.speech_keep_leading_trailing_pad_sec,

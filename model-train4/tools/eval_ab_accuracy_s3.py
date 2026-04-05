@@ -40,6 +40,7 @@ DEFAULT_INPUT_JSONL = PROJECT_ROOT / "data" / "manifests" / "train_test.jsonl"
 DEFAULT_S3_CACHE_DIR = PROJECT_ROOT / "s3_cache"
 DEFAULT_SIDEINFO_CACHE_DIR = PROJECT_ROOT / "cache"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "eval_100_base_s3"
+DEFAULT_MUSIC_GENRE_MODEL = "dima806/music_genres_classification"
 
 ANSWER_RE = re.compile(r"<answer>\s*([AB])\s*</answer>", re.IGNORECASE)
 DIRECT_ANSWER_RE = re.compile(r"^\s*([AB])\s*$", re.IGNORECASE)
@@ -58,12 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_video_duration", type=float, default=45.0)
     parser.add_argument("--whisper_model", default="large-v3")
     parser.add_argument("--whisper_device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--speech_segmentation_mode", choices=("off", "inaspeech"), default="off")
+    parser.add_argument("--speech_segmentation_mode", choices=("off", "inaspeech"), default="inaspeech")
     parser.add_argument("--speech_min_segment_sec", type=float, default=0.35)
     parser.add_argument("--speech_merge_gap_sec", type=float, default=0.25)
     parser.add_argument("--speech_keep_leading_trailing_pad_sec", type=float, default=0.10)
     parser.add_argument("--segmentation_fallback_to_full_audio", action="store_true", default=True)
     parser.add_argument("--no_segmentation_fallback_to_full_audio", action="store_false", dest="segmentation_fallback_to_full_audio")
+    parser.add_argument("--music_genre_model", default=DEFAULT_MUSIC_GENRE_MODEL)
+    parser.add_argument("--music_genre_device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max_think_tokens", type=int, default=2000)
     parser.add_argument("--max_answer_tokens", type=int, default=128)
     parser.add_argument("--max_new_tokens", type=int, default=2200)
@@ -559,6 +562,8 @@ def main() -> None:
                 speech_merge_gap_sec=args.speech_merge_gap_sec,
                 speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
                 segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+                music_genre_model=args.music_genre_model,
+                music_genre_device=args.music_genre_device,
             )
             side_b = extract_video_side_info(
                 video_path=local_b,
@@ -571,6 +576,8 @@ def main() -> None:
                 speech_merge_gap_sec=args.speech_merge_gap_sec,
                 speech_keep_leading_trailing_pad_sec=args.speech_keep_leading_trailing_pad_sec,
                 segmentation_fallback_to_full_audio=args.segmentation_fallback_to_full_audio,
+                music_genre_model=args.music_genre_model,
+                music_genre_device=args.music_genre_device,
             )
             record["sideinfo_cache_hit_a"] = bool(side_a.get("cache_hit", False))
             record["sideinfo_cache_hit_b"] = bool(side_b.get("cache_hit", False))
@@ -603,6 +610,8 @@ def main() -> None:
             "author_context": pair_raw.get("author_context", ""),
             "transcript_a": side_a.get("transcript", ""),
             "transcript_b": side_b.get("transcript", ""),
+            "lyrics_a": side_a.get("lyrics_transcript", ""),
+            "lyrics_b": side_b.get("lyrics_transcript", ""),
             "audio_summary_a": side_a.get("audio_summary", ""),
             "audio_summary_b": side_b.get("audio_summary", ""),
         }
