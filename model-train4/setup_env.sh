@@ -47,6 +47,7 @@ python -m pip install --upgrade \
   librosa \
   soundfile \
   faster-whisper \
+  inaSpeechSegmenter \
   diffusers
 
 echo ">>> Verifying environment"
@@ -64,6 +65,7 @@ for pkg in [
     "bitsandbytes",
     "librosa",
     "faster_whisper",
+    "inaSpeechSegmenter",
 ]:
     mod = importlib.import_module(pkg)
     print(f"{pkg}={getattr(mod, '__version__', 'unknown')}")

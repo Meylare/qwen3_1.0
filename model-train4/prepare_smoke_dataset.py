@@ -26,7 +26,7 @@ from prompting import build_prompt, deterministic_flip
 
 
 TRANSCRIPT_VERSION = "v2"
-AUDIO_SUMMARY_VERSION = "v2"
+AUDIO_SUMMARY_VERSION = "v3"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "raw" / "train_fixed.jsonl"
 DEFAULT_VIDEO_DIR = PROJECT_ROOT / "data" / "raw" / "pair_vid"
@@ -150,6 +150,15 @@ def describe_level(value: float, low: float, high: float, labels: Tuple[str, str
     return labels[2]
 
 
+def estimate_speech_seconds_from_transcript(transcript_segments: Iterable[Any]) -> float:
+    speech_seconds = 0.0
+    for seg in transcript_segments:
+        start = max(0.0, get_segment_start(seg))
+        end = max(start, get_segment_end(seg))
+        speech_seconds += max(0.0, end - start)
+    return speech_seconds
+
+
 def build_audio_summary(
     wav_path: Path,
     transcript_text: str,
@@ -180,42 +189,44 @@ def build_audio_summary(
     centroid_hz = float(np.mean(spectral_centroid)) if spectral_centroid.size else 0.0
     zcr = float(np.mean(zero_crossings)) if zero_crossings.size else 0.0
 
-    speech_seconds = 0.0
-    if segmentation_info is not None:
-        speech_seconds = float(segmentation_info.get("speech_sec", 0.0) or 0.0)
-    else:
-        for seg in transcript_segments:
-            start = max(0.0, get_segment_start(seg))
-            end = max(start, get_segment_end(seg))
-            speech_seconds += max(0.0, end - start)
+    speech_seconds = (
+        float(segmentation_info.get("speech_sec", 0.0) or 0.0)
+        if segmentation_info is not None
+        else estimate_speech_seconds_from_transcript(transcript_segments)
+    )
     speech_ratio = min(1.0, speech_seconds / duration) if duration > 0 else 0.0
-
-    transcript_words = len(re.findall(r"\w+", transcript_text))
-    speech_profile = describe_level(speech_ratio, 0.2, 0.6, ("music/noise-heavy", "mixed speech-and-sound", "speech-dominant"))
-    energy_profile = describe_level(loudness_db, -28.0, -18.0, ("low-energy", "medium-energy", "high-energy"))
+    speech_profile = describe_level(
+        speech_ratio,
+        0.2,
+        0.6,
+        ("music/noise-heavy", "mixed speech-and-sound", "speech-dominant"),
+    )
     rhythm_profile = describe_level(tempo, 80.0, 130.0, ("slow", "moderate", "fast"))
+    energy_profile = describe_level(loudness_db, -28.0, -18.0, ("low-energy", "medium-energy", "high-energy"))
     brightness_profile = describe_level(centroid_hz, 1200.0, 2600.0, ("warm/dark", "balanced", "bright"))
 
     language_text = detected_language or "unknown"
     extra_parts: List[str] = []
     if segmentation_info is not None:
         extra_parts.append(
-            "Transcript derived from "
-            f"{transcript_source.replace('_', '-')}. "
-            f"Segmentation found speech={float(segmentation_info.get('speech_sec', 0.0) or 0.0):.1f}s, "
+            f"Transcript derived from {transcript_source.replace('_', '-')}. "
+            f"inaSpeech breakdown: speech={float(segmentation_info.get('speech_sec', 0.0) or 0.0):.1f}s, "
             f"music={float(segmentation_info.get('music_sec', 0.0) or 0.0):.1f}s, "
-            f"noise={float(segmentation_info.get('noise_sec', 0.0) or 0.0):.1f}s "
-            f"across {int(segmentation_info.get('num_speech_segments', 0) or 0)} speech segments."
+            f"noise={float(segmentation_info.get('noise_sec', 0.0) or 0.0):.1f}s, "
+            f"speech segments={int(segmentation_info.get('num_speech_segments', 0) or 0)}."
         )
         if speech_seconds <= 0:
             extra_parts.append("Author speech was not detected after segmentation.")
 
     return (
-        f"Audio duration {duration:.1f}s. Detected language: {language_text}. "
-        f"Transcript length: {transcript_words} words. Speech coverage is about {speech_ratio:.2f} of the clip, "
-        f"so the soundtrack is {speech_profile}. Estimated rhythm is {rhythm_profile} at about {tempo:.0f} BPM. "
-        f"Average loudness is {loudness_db:.1f} dBFS with dynamic range {dynamic_range_db:.1f} dB, giving a "
-        f"{energy_profile} feel. Silence ratio is {silence_ratio:.2f}. Spectral brightness is {brightness_profile} "
+        f"Detected language: {language_text}. "
+        f"Soundtrack class: {speech_profile}. "
+        f"Rhythm: {rhythm_profile} at ~{tempo:.0f} BPM. "
+        f"Loudness: {loudness_db:.1f} dBFS. "
+        f"Dynamic range: {dynamic_range_db:.1f} dB. "
+        f"Energy feel: {energy_profile}. "
+        f"Silence ratio: {silence_ratio:.2f}. "
+        f"Spectral brightness is {brightness_profile} "
         f"(centroid {centroid_hz:.0f} Hz, zero-crossing rate {zcr:.3f})."
         + (f" {' '.join(extra_parts)}" if extra_parts else "")
     )
