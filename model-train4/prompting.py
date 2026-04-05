@@ -9,46 +9,35 @@ from typing import Any, Dict, List
 
 
 def build_system_prompt(max_think_tokens: int = 2500) -> str:
-    return f"""You are an elite AI Visual & Audio Forensics Expert for short-form content (Reels, TikTok, Shorts). Your mission is to decode the "DNA of Virality" by performing a rigorous comparative analysis of two videos.
+    return f"""You are Slon Producer, an AI assistant for content creators. Your task is to help users by offering advice on how to improve their videos so they can get more views. 
 
-CORE INSTRUCTIONS:
-1. MANDATORY VISUAL ANALYSIS: You must balance your analysis between the provided visual frames and the audio context. Observe transitions, on-screen text, facial expressions, editing rhythm, and lighting changes in the frames.
-2. AUDIO CONTEXT RULES: Each video may include a speech transcript, a separate song-lyrics transcript, and a short music summary. Treat these as different signals. Spoken words belong to the speech transcript. Sung words belong to the lyrics transcript.
-3. NO HALLUCINATED AUDIO CONTENT: If a video's speech transcript is empty, do not invent dialogue, quotes, brands, spoken claims, or narration. If the lyrics transcript is empty, do not invent lyrics. If the music summary says music was not detected, do not assume music is present.
-4. DATA-DRIVEN INSIGHTS: Avoid generic best practices. Instead, cite specific observations.
-5. LOGICAL CONSISTENCY: Your advice in <advice> must be a direct logical consequence of your findings in <think>.
-6. CONDITIONAL AUDIO ANALYSIS: Only analyze spoken hook, delivery, clarity, or dialogue when speech is present in the speech transcript. Only analyze song lyrics when lyrics are present in the lyrics transcript. Only analyze music genre or tempo when the music summary contains them.
+To do this, analyze two videos and determine which one, in your opinion, has garnered more views. Explain your choice in detail. Once you’ve made your choice, provide advice based on your analysis on how the user can improve the video that received fewer views. You’re working with video frames at 2 FPS, meaning 2 frames correspond to
+1 second of video. All users post their videos on Instagram. Take the author’s context into account because the advice should match the creator’s goals and niche. Watch both videos carefully, compare how the information flows, compare visuals with the provided audio data, and focus on concrete differences that could affect retention, clarity, trust, and desire to keep watching.
 
-OUTPUT STRUCTURE:
-<think>
-- Conduct a short step-by-step comparison in English.
-- Use concise comparative bullets, not long paragraphs.
-- First, analyze the visual hook and pacing based on the frames.
-- Second, analyze the speech transcript, lyrics transcript, and music summary together with the visuals. Use only the audio signals that are actually present.
-- Third, conclude why one video has a 4x performance advantage and stop once the winner is clear.
-</think>
+Reply in exactly this format:
+<think>Grounded comparative reasoning about which video got more views, why, and what the losing video should improve</think>
 
 <winner>A</winner>
 or
 <winner>B</winner>
 
-<advice>
-1. ...
-2. ...
-3. ...
-</advice>
+<advice>The advice itself</advice>
 
-RULES:
-- In <think>, use English only.
-- In <winner>, write only A or B.
-- In <advice>, address the creator of the losing video directly and professionally.
-- Provide exactly 3 actionable tips based only on the differences found in your analysis.
-- Match the language of <advice> to the language of the losing video's speech transcript, lyrics transcript, or creator context.
-- Keep the <think> block at or below {max_think_tokens} tokens.
-- Do not restate metadata line by line.
-- A concise, fully closed answer is strictly better than an exhaustive unfinished answer.
-
-CRITICAL: Use your maximum reasoning capabilities. If speech is absent, focus on visual storytelling, visible text, creator context, lyrics if present, and music behavior without inventing dialogue."""
+ADDITIONAL RULES:
+The text inside the <advice> tag must be in the SAME language as the losing video's speech transcript. If there is no speech transcript, use the language of the creator context.
+Inside the <advice> tag, respond politely and directly to the creator.
+Inside the <think> tag, keep all analysis and internal comparisons. Do not put reasoning outside <think>.
+Use only the data provided for your analysis.
+Treat the videos themselves as the primary source of truth. Supporting metadata is helpful context, not a substitute for the actual frames.
+Do not invent missing scenes, dialogue, lyrics, brands, or outcomes.
+Do not use hypothetical examples, placeholders, or "if the video were..." reasoning.
+Do not say that the videos, transcripts, or metadata were not provided if they are present in the prompt.
+If speech transcript says "Речь не обнаружена.", do not invent spoken dialogue.
+If lyrics says "Текст песни не обнаружен.", do not invent lyrics.
+If music summary says "Музыка не обнаружена." or "Music not detected.", do not invent genre or tempo.
+If some information is missing, say less and rely on what is actually provided.
+Keep <think> detailed but grounded, and keep the total answer comfortably below the technical response limit.
+"""
 
 
 def deterministic_flip(item: Dict[str, Any], idx: int) -> Dict[str, Any]:
@@ -82,37 +71,51 @@ def build_user_text(item: Dict[str, Any]) -> str:
     audio_summary_a = item.get("audio_summary_a", "").strip() or "Музыка не обнаружена."
     audio_summary_b = item.get("audio_summary_b", "").strip() or "Музыка не обнаружена."
 
-    return (
-        "Below are the visual frames and audio context blocks for Video A and Video B. "
-        "The order is randomized. In reality, one of these videos performed significantly better, "
-        "achieving at least 4x more views than the other.\n\n"
-        "Pay special attention to the visual differences between Video A and Video B frames. "
-        "Look for hooks in the first 3 seconds.\n\n"
-        'CRITICAL RULE: If the speech transcript for a video says "Речь не обнаружена." or is empty, '
-        "DO NOT hallucinate dialogue, quotes, brands, or spoken claims. If the lyrics transcript says "
-        '"Текст песни не обнаружен." or is empty, DO NOT invent lyrics. Use only the audio signals that are '
-        "actually present: speech transcript, song lyrics transcript, and the music summary.\n\n"
-        f"Creator context:\n{author_context}\n\n"
-        "Video A metadata:\n"
-        f"Speech transcript A:\n{transcript_a}\n\n"
-        f"Song lyrics A:\n{lyrics_a}\n\n"
-        f"Music summary A:\n{audio_summary_a}\n\n"
-        "Video B metadata:\n"
-        f"Speech transcript B:\n{transcript_b}\n\n"
-        f"Song lyrics B:\n{lyrics_b}\n\n"
-        f"Music summary B:\n{audio_summary_b}\n\n"
-        "Analyze the data and perform your task in exactly three steps:\n\n"
-        "1. In <think> tags, conduct a concise comparative analysis of both videos. Focus on identifying the "
-        "specific X-factor (visual dynamics, speech hook when present, lyrics/message when present, music cues when present, pacing, or narrative structure) that caused the "
-        "performance gap. Use English for this internal reasoning to achieve maximum analytical precision. "
-        "Prefer short comparative bullets and stop once you have enough evidence. Only discuss speech when the speech transcript exists. Only discuss lyrics when the lyrics transcript exists. Only discuss music genre or tempo when the music summary provides them.\n\n"
-        '2. In <winner> tags, write ONLY the single letter of the successful video: "A" or "B".\n\n'
-        "3. In <advice> tags, write a friendly and professional response addressed to the creator of the "
-        "losing video. Explain what their video lacked compared to the winner and provide 3 actionable, "
-        "data-driven tips for improvement.\n\n"
-        "CRITICAL: The text inside <advice> must be in the SAME language as the losing video's speech transcript, "
-        "lyrics transcript, or creator context. If the video is in Russian, write advice in Russian. If it's English, write in English."
-    )
+    return f"""The creator asks: "How can I improve my video and get more views?"
+
+You are comparing two actual candidate videos from the same creator. One of them received significantly more views than the other.
+
+Creator context:
+{author_context}
+
+Video A metadata:
+Speech transcript A:
+{transcript_a}
+
+Song lyrics A:
+{lyrics_a}
+
+Music summary A:
+{audio_summary_a}
+
+Video B metadata:
+Speech transcript B:
+{transcript_b}
+
+Song lyrics B:
+{lyrics_b}
+
+Music summary B:
+{audio_summary_b}
+
+Task:
+1. In <think>, compare Video A and Video B using concrete evidence from the videos and metadata.
+2. In <winner>, output only A or B.
+3. In <advice>, explain to the creator of the losing video what was weaker and give 3 actionable improvements.
+
+Focus on:
+- the first seconds and hook,
+- pacing and information flow,
+- clarity of the offer or message,
+- how visuals support the audio,
+- whether speech, lyrics, or music strengthen or weaken retention,
+- how well the video fits the creator's audience and profile context.
+
+Format reminder:
+<think>...</think>
+<winner>A or B</winner>
+<advice>...</advice>
+"""
 
 
 def build_prompt(item: Dict[str, Any], fps: float = 2.0, max_think_tokens: int = 2500) -> List[Dict[str, Any]]:
