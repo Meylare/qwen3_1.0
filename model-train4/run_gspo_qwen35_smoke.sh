@@ -2,11 +2,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/.venv"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+HOME_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
+VENV_DIR="${SCRIPT_DIR}/.venv5"
 DATA_DIR="${SCRIPT_DIR}/data"
 OUTPUT_DIR="${SCRIPT_DIR}/output/qwen35_9b_base_gspo_smoke"
-TRAIN_JSONL="${TRAIN_JSONL:-${SCRIPT_DIR}/../../train.jsonl}"
-MODEL_PATH="${MODEL_PATH:-${SCRIPT_DIR}/../../models/Qwen3.5-9B-Base}"
+TRAIN_JSONL="${TRAIN_JSONL:-${SCRIPT_DIR}/data/raw/train_fixed.jsonl}"
+MODEL_PATH="${MODEL_PATH:-${HOME_ROOT}/models/Qwen3.5-9B-Base}"
 SMOKE_PAIRS="${SMOKE_PAIRS:-10}"
 WHISPER_MODEL="${WHISPER_MODEL:-small}"
 

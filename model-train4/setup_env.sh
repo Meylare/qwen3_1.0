@@ -14,6 +14,11 @@ source "${VENV_DIR}/bin/activate"
 echo ">>> Python: $(which python) ($(python --version))"
 python -m pip install --upgrade pip "setuptools<81" wheel
 
+TRL_VERSION="0.24.0"
+DATASETS_VERSION="4.3.0"
+PYARROW_SPEC="pyarrow>=21,<24"
+TRANSFORMERS_VERSION="5.2.0"
+
 echo ">>> Installing PyTorch nightly cu128 for Blackwell"
 python -m pip install --pre torch torchvision torchaudio \
   --index-url https://download.pytorch.org/whl/nightly/cu128
@@ -21,10 +26,11 @@ python -m pip install --pre torch torchvision torchaudio \
 echo ">>> Installing Unsloth + RL/VLM stack"
 python -m pip install --upgrade --force-reinstall --no-cache-dir unsloth unsloth_zoo
 python -m pip install --upgrade \
-  trl \
+  "trl==${TRL_VERSION}" \
+  "transformers==${TRANSFORMERS_VERSION}" \
   accelerate \
-  datasets \
-  "pyarrow<21" \
+  "datasets==${DATASETS_VERSION}" \
+  "${PYARROW_SPEC}" \
   peft \
   bitsandbytes \
   sentencepiece \
@@ -32,9 +38,11 @@ python -m pip install --upgrade \
   pillow \
   numpy \
   scipy \
+  mergekit \
   orjson \
   tqdm \
   psutil \
+  boto3 \
   ffmpeg-python \
   librosa \
   soundfile \
@@ -60,5 +68,6 @@ for pkg in [
     mod = importlib.import_module(pkg)
     print(f"{pkg}={getattr(mod, '__version__', 'unknown')}")
 PY
+python -m pip check
 
 echo ">>> Environment is ready"

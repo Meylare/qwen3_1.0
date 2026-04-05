@@ -48,6 +48,28 @@ def resolve_model_path(model_name: str) -> str:
     return str(model_path.resolve())
 
 
+def ensure_chat_template(processor: Any, model_path: str) -> str | None:
+    current_template = getattr(processor, "chat_template", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    tokenizer_template = getattr(tokenizer, "chat_template", None) if tokenizer is not None else None
+
+    chat_template = current_template or tokenizer_template
+    if not chat_template:
+        tokenizer_config_path = Path(model_path) / "tokenizer_config.json"
+        if tokenizer_config_path.exists():
+            tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+            chat_template = tokenizer_config.get("chat_template")
+
+    if not chat_template:
+        return None
+
+    if tokenizer is not None and getattr(tokenizer, "chat_template", None) is None:
+        tokenizer.chat_template = chat_template
+    if getattr(processor, "chat_template", None) is None:
+        processor.chat_template = chat_template
+    return chat_template
+
+
 def main() -> None:
     args = parse_args()
     sample = load_jsonl_row(args.dataset_jsonl, args.sample_index)
@@ -73,6 +95,7 @@ def main() -> None:
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "left"
+    chat_template = ensure_chat_template(processor, resolved_base_model)
 
     base_model = Qwen3_5ForConditionalGeneration.from_pretrained(resolved_base_model, **model_kwargs)
     model = PeftModel.from_pretrained(base_model, str(args.adapter_dir))
@@ -80,6 +103,7 @@ def main() -> None:
 
     inputs = processor.apply_chat_template(
         sample["prompt"],
+        chat_template=chat_template,
         tokenize=True,
         add_generation_prompt=True,
         return_dict=True,
