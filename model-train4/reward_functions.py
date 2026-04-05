@@ -27,6 +27,10 @@ LANG_RE = re.compile(r"detected language:\s*([a-z]{2,3}(?:-[a-z]{2,3})?)", re.IG
 CREATOR_CONTEXT_RE = re.compile(r"creator context:\s*(.*?)\n\s*video a metadata:", re.IGNORECASE | re.DOTALL)
 SPEECH_COVERAGE_RE = re.compile(r"speech coverage is about\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 TRANSCRIPT_LENGTH_RE = re.compile(r"transcript length:\s*(\d+)\s+words", re.IGNORECASE)
+SEGMENTATION_SPEECH_RE = re.compile(
+    r"(?:segmentation found|inaspeech breakdown:)\s*speech=\s*([0-9]*\.?[0-9]+)s",
+    re.IGNORECASE,
+)
 
 GENERIC_ADVICE_PATTERNS = (
     "make it more engaging",
@@ -210,6 +214,15 @@ def is_music_only_case(audio_summary: Any, transcript: Any) -> bool:
     summary = coerce_text(audio_summary)
     transcript_text = coerce_text(transcript).strip()
 
+    speech_match = SEGMENTATION_SPEECH_RE.search(summary)
+    if speech_match:
+        try:
+            speech_seconds = float(speech_match.group(1))
+            if speech_seconds <= 0.01 and not transcript_text:
+                return True
+        except ValueError:
+            pass
+
     coverage_match = SPEECH_COVERAGE_RE.search(summary)
     if coverage_match:
         try:
@@ -231,7 +244,7 @@ def is_music_only_case(audio_summary: Any, transcript: Any) -> bool:
     lowered = summary.lower()
     if "author speech was not detected after segmentation" in lowered and not transcript_text:
         return True
-    if "soundtrack is music/noise-heavy" in lowered and not transcript_text:
+    if "soundtrack class: music/noise-heavy" in lowered and not transcript_text:
         return True
     return False
 
