@@ -1,0 +1,82 @@
+{
+  "video_path": "/home/ubuntu/model-train/model-train4/s3_cache/slon-bucket2/video_pairs/DVYTdfeDK_5.mp4",
+  "transcript": "[0.00-3.08] Не покупайте такие диваны на маркетплейсах.\n[3.22-7.64] У нас цена гораздо ниже, чем в маркетплейсах и на левом берегу.\n[7.92-11.86] Например, вот такой вот трендовый диван в мебельном салоне 2 кита.\n[12.40-13.86] И Динара вам о нем расскажет.\n[14.20-19.00] Добрый день. Диван Dallas. Размер идет 2,45 на 95.\n[19.54-22.02] Ткань идет букле. Рассветку вы можете выбрать.\n[22.52-26.02] Также по индивидуальным размерам мы изготавливаем на заказ.\n[26.02-30.16] Ножки идут деревянные. Также посередине идет металлическая ножка.\n[30.86-35.80] Приходите к нам в мебельный салон 2 кита, улица Акжол 28, торговый центр Авалон.",
+  "transcript_segments": [
+    {
+      "start": 0.0,
+      "end": 3.08,
+      "text": " Не покупайте такие диваны на маркетплейсах."
+    },
+    {
+      "start": 3.22,
+      "end": 7.64,
+      "text": " У нас цена гораздо ниже, чем в маркетплейсах и на левом берегу."
+    },
+    {
+      "start": 7.92,
+      "end": 11.86,
+      "text": " Например, вот такой вот трендовый диван в мебельном салоне 2 кита."
+    },
+    {
+      "start": 12.4,
+      "end": 13.86,
+      "text": " И Динара вам о нем расскажет."
+    },
+    {
+      "start": 14.2,
+      "end": 19.0,
+      "text": " Добрый день. Диван Dallas. Размер идет 2,45 на 95."
+    },
+    {
+      "start": 19.54,
+      "end": 22.02,
+      "text": " Ткань идет букле. Рассветку вы можете выбрать."
+    },
+    {
+      "start": 22.52,
+      "end": 26.02,
+      "text": " Также по индивидуальным размерам мы изготавливаем на заказ."
+    },
+    {
+      "start": 26.02,
+      "end": 30.16,
+      "text": " Ножки идут деревянные. Также посередине идет металлическая ножка."
+    },
+    {
+      "start": 30.86,
+      "end": 35.8,
+      "text": " Приходите к нам в мебельный салон 2 кита, улица Акжол 28, торговый центр Авалон."
+    }
+  ],
+  "lyrics_transcript": "[35.92-37.92] Thanks for watching!",
+  "lyrics_transcript_segments": [
+    {
+      "start": 35.92,
+      "end": 37.92,
+      "text": " Thanks for watching!"
+    }
+  ],
+  "audio_summary": "Music genre: hiphop (0.92 confidence). Music tempo: ~99 BPM.",
+  "detected_language": "ru",
+  "lyrics_detected_language": "en",
+  "speech_segmentation_mode": "inaspeech",
+  "segmentation_applied": true,
+  "segmentation_fallback": false,
+  "transcript_source": "speech_only",
+  "segmentation_total_audio_sec": 39.2664,
+  "segmentation_speech_sec": 36.02,
+  "segmentation_music_sec": 2.02,
+  "segmentation_noise_sec": 1.3264,
+  "segmentation_speech_ratio": 0.9173,
+  "segmentation_num_speech_segments": 1,
+  "speech_only_audio_sec": 36.02,
+  "music_only_audio_sec": 2.02,
+  "segmentation_summary": "Segmentation mode inaspeech | speech=36.0s | music=2.0s | noise=1.3s | speech_ratio=0.92 | speech_segments=1",
+  "segmentation_sec": 2.9289,
+  "audio_extract_sec": 0.1285,
+  "transcription_sec": 1.8681,
+  "lyrics_transcription_sec": 0.3165,
+  "audio_summary_sec": 1.5574,
+  "total_sec": 6.8515,
+  "cache_hit": false
+}

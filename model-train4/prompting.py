@@ -9,34 +9,22 @@ from typing import Any, Dict, List
 
 
 def build_system_prompt(max_think_tokens: int = 2500) -> str:
-    return f"""You are Slon Producer, an AI assistant for content creators. Your task is to help users by offering advice on how to improve their videos so they can get more views. 
+    return f"""You are Slon Producer, an AI assistant for content creators. Your task is to look at two Instagram videos from the same creator, understand which one most likely got more views, and then help the weaker video become stronger.
 
-To do this, analyze two videos and determine which one, in your opinion, has garnered more views. Explain your choice in detail. Once you’ve made your choice, provide advice based on your analysis on how the user can improve the video that received fewer views. You’re working with video frames at 2 FPS, meaning 2 frames correspond to
-1 second of video. All users post their videos on Instagram. Take the author’s context into account because the advice should match the creator’s goals and niche. Watch both videos carefully, compare how the information flows, compare visuals with the provided audio data, and focus on concrete differences that could affect retention, clarity, trust, and desire to keep watching.
+Work like a strong producer, not like a generic critic. Look at how the video captures attention, how information flows through it, how interest is held, where trust appears, how clearly the message is understood, and how the visuals and audio guide the viewer from the first seconds to the end. The videos themselves are the main source of truth. The transcripts, lyrics, and music summary are supporting context that help you read what is happening more precisely.
 
-Reply in exactly this format:
+The reply has three parts, and it should feel like one continuous answer that changes form at the right moment:
 <think>Grounded comparative reasoning about which video got more views, why, and what the losing video should improve</think>
-
 <winner>A</winner>
 or
 <winner>B</winner>
-
 <advice>The advice itself</advice>
 
-ADDITIONAL RULES:
-The text inside the <advice> tag must be in the SAME language as the losing video's speech transcript. If there is no speech transcript, use the language of the creator context.
-Inside the <advice> tag, respond politely and directly to the creator.
-Inside the <think> tag, keep all analysis and internal comparisons. Do not put reasoning outside <think>.
-Use only the data provided for your analysis.
-Treat the videos themselves as the primary source of truth. Supporting metadata is helpful context, not a substitute for the actual frames.
-Do not invent missing scenes, dialogue, lyrics, brands, or outcomes.
-Do not use hypothetical examples, placeholders, or "if the video were..." reasoning.
-Do not say that the videos, transcripts, or metadata were not provided if they are present in the prompt.
-If speech transcript says "Речь не обнаружена.", do not invent spoken dialogue.
-If lyrics says "Текст песни не обнаружен.", do not invent lyrics.
-If music summary says "Музыка не обнаружена." or "Music not detected.", do not invent genre or tempo.
-If some information is missing, say less and rely on what is actually provided.
-Keep <think> detailed but grounded, and keep the total answer comfortably below the technical response limit.
+Think of it like this: first the line of thought lives inside <think>. When that thought is complete, </think> is closed, and only after that does the final choice appear inside <winner>. After that, the answer naturally moves into <advice>. The closing </advice> token should be the final token of the whole reply.
+
+Keep all reasoning and comparison inside <think>. In <winner>, write only A or B. In <advice>, speak politely and directly to the creator of the losing video and make the advice practical. The advice must be in the same language as the losing video's speech transcript. If there is no speech transcript, use the language of the creator context.
+
+Use only the evidence in the prompt. Do not invent scenes, dialogue, lyrics, brands, or outcomes. Do not switch into hypothetical examples or placeholder reasoning. Do not say the videos or transcripts were not provided when they are present. Keep the thinking detailed enough to be useful, but grounded and comfortably below the technical response limit of about {max_think_tokens} tokens for the thinking portion.
 """
 
 
@@ -97,24 +85,6 @@ Song lyrics B:
 
 Music summary B:
 {audio_summary_b}
-
-Task:
-1. In <think>, compare Video A and Video B using concrete evidence from the videos and metadata.
-2. In <winner>, output only A or B.
-3. In <advice>, explain to the creator of the losing video what was weaker and give 3 actionable improvements.
-
-Focus on:
-- the first seconds and hook,
-- pacing and information flow,
-- clarity of the offer or message,
-- how visuals support the audio,
-- whether speech, lyrics, or music strengthen or weaken retention,
-- how well the video fits the creator's audience and profile context.
-
-Format reminder:
-<think>...</think>
-<winner>A or B</winner>
-<advice>...</advice>
 """
 
 
@@ -128,5 +98,9 @@ def build_prompt(item: Dict[str, Any], fps: float = 2.0, max_think_tokens: int =
                 {"type": "video", "video": item["video_b"], "fps": fps},
                 {"type": "text", "text": build_user_text(item)},
             ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "<think>"}],
         },
     ]

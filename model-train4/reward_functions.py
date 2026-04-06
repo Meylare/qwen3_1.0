@@ -91,6 +91,7 @@ CONCRETE_HINT_PATTERNS = (
 
 MIN_ADVICE_LANG_CHARS = 20
 MIN_REASONING_CHARS = 24
+MIN_ADVICE_QUALITY_CHARS = 120
 DEFAULT_MAX_COMPLETION_LENGTH = 2500
 
 _LAST_REWARD_DEBUG_BATCH: List[Dict[str, Any]] = []
@@ -293,7 +294,7 @@ def determine_target_language(
 def reasoning_signal(think_text: str) -> float:
     normalized = re.sub(r"\s+", " ", think_text).strip()
     if len(normalized) < MIN_REASONING_CHARS:
-        return -0.05
+        return -0.10
     return 0.05
 
 
@@ -331,6 +332,54 @@ def has_unfinished_structure(text: Any) -> bool:
     return status in {"missing_winner", "missing_advice", "missing_think", "winner_only"}
 
 
+def tag_cleanliness_signal(completion: Any) -> tuple[float, bool]:
+    normalized = coerce_text(completion)
+    penalty = 0.0
+
+    think_match = THINK_RE.search(normalized)
+    if think_match is None:
+        think_match = THINK_PREFILL_RE.search(normalized)
+
+    if think_match is None:
+        think_open = re.search(r"<think>", normalized, re.IGNORECASE)
+        if think_open and normalized[: think_open.start()].strip():
+            penalty -= 0.10
+        elif normalized.strip():
+            penalty -= 0.10
+        return max(-0.30, round(penalty, 4)), penalty < 0.0
+
+    trailing = normalized[think_match.end() :]
+    winner_match = WINNER_RE.search(trailing)
+    if winner_match is None:
+        winner_match = ANSWER_RE.search(trailing)
+
+    if winner_match is None:
+        if trailing.strip():
+            penalty -= 0.10
+        return max(-0.30, round(penalty, 4)), penalty < 0.0
+
+    between_think_and_winner = trailing[: winner_match.start()].strip()
+    if between_think_and_winner:
+        penalty -= 0.10
+
+    after_winner = trailing[winner_match.end() :]
+    advice_match = ADVICE_RE.search(after_winner)
+    if advice_match is None:
+        if after_winner.strip():
+            penalty -= 0.10
+        return max(-0.30, round(penalty, 4)), penalty < 0.0
+
+    between_winner_and_advice = after_winner[: advice_match.start()].strip()
+    if between_winner_and_advice:
+        penalty -= 0.10
+
+    after_advice = after_winner[advice_match.end() :].strip()
+    if after_advice:
+        penalty -= 0.10
+
+    return max(-0.30, round(penalty, 4)), penalty < 0.0
+
+
 def length_signal(completion: Any, max_completion_length: int) -> tuple[float, bool, bool, int]:
     completion_text = coerce_text(completion)
     completion_char_length = len(completion_text)
@@ -365,6 +414,13 @@ def language_signal(advice_text: str, target_language: Optional[str]) -> tuple[f
     return -0.2, advice_language
 
 
+def advice_quality_signal(advice_text: str) -> tuple[float, bool]:
+    normalized = re.sub(r"\s+", " ", advice_text).strip()
+    if len(normalized) < MIN_ADVICE_QUALITY_CHARS:
+        return -0.10, True
+    return 0.0, False
+
+
 def build_reward_debug_entry(completion: Any, gt: str, **context: Any) -> Dict[str, Any]:
     predicted = parse_winner_block(completion)
     think_text = extract_think(completion)
@@ -372,19 +428,13 @@ def build_reward_debug_entry(completion: Any, gt: str, **context: Any) -> Dict[s
     status = format_status(completion)
 
     if predicted is None:
-        reward_accuracy = -1.5
+        reward_accuracy = -1.25
     elif predicted == gt:
         reward_accuracy = 1.0
     else:
         reward_accuracy = -1.0
 
-    if status == "full":
-        reward_format = 0.2
-    elif status == "missing_winner":
-        reward_format = -0.5
-    else:
-        reward_format = -0.1
-
+    reward_format = 0.0
     target_language = determine_target_language(
         gt,
         prompt=context.get("prompt"),
@@ -395,19 +445,19 @@ def build_reward_debug_entry(completion: Any, gt: str, **context: Any) -> Dict[s
         audio_summary_a=context.get("audio_summary_a"),
         audio_summary_b=context.get("audio_summary_b"),
     )
-    reward_language, advice_language = language_signal(advice_text, target_language)
-
-    reward_reasoning = reasoning_signal(think_text)
+    reward_language = 0.0
+    advice_language = detect_language(advice_text)
+    reward_reasoning = 0.0
     generic_penalty_applied = False
-    if advice_text and is_generic_advice(advice_text) and not has_concrete_advice_signal(advice_text):
-        reward_reasoning -= 0.05
-        generic_penalty_applied = True
-
+    reward_tag_cleanliness = 0.0
+    tag_cleanliness_penalty_applied = False
+    reward_advice_quality = 0.0
+    short_advice_penalty_applied = False
     max_completion_length = resolve_max_completion_length(context)
-    reward_length, near_cap_penalty_applied, unfinished_near_cap_penalty_applied, completion_char_length = length_signal(
-        completion,
-        max_completion_length=max_completion_length,
-    )
+    reward_length = 0.0
+    near_cap_penalty_applied = False
+    unfinished_near_cap_penalty_applied = False
+    completion_char_length = len(coerce_text(completion))
 
     return {
         "ground_truth_winner": gt,
@@ -416,16 +466,29 @@ def build_reward_debug_entry(completion: Any, gt: str, **context: Any) -> Dict[s
         "advice_language": advice_language,
         "format_status": status,
         "generic_advice_penalty_applied": generic_penalty_applied,
+        "tag_cleanliness_penalty_applied": tag_cleanliness_penalty_applied,
+        "short_advice_penalty_applied": short_advice_penalty_applied,
         "near_cap_penalty_applied": near_cap_penalty_applied,
         "unfinished_near_cap_penalty_applied": unfinished_near_cap_penalty_applied,
         "completion_char_length": completion_char_length,
         "max_completion_length": max_completion_length,
         "reward_accuracy": round(reward_accuracy, 4),
         "reward_format": round(reward_format, 4),
+        "reward_tag_cleanliness": round(reward_tag_cleanliness, 4),
         "reward_language": round(reward_language, 4),
         "reward_reasoning": round(reward_reasoning, 4),
+        "reward_advice_quality": round(reward_advice_quality, 4),
         "reward_length": round(reward_length, 4),
-        "reward_total": round(reward_accuracy + reward_format + reward_language + reward_reasoning + reward_length, 4),
+        "reward_total": round(
+            reward_accuracy
+            + reward_format
+            + reward_tag_cleanliness
+            + reward_language
+            + reward_reasoning
+            + reward_advice_quality
+            + reward_length,
+            4,
+        ),
     }
 
 
@@ -475,9 +538,19 @@ def language_reward(completions: List[str], label: List[str], **kwargs: Any) -> 
     return [row["reward_language"] for row in batch]
 
 
+def tag_cleanliness_reward(completions: List[str], label: List[str], **kwargs: Any) -> List[float]:
+    batch = build_reward_debug_batch(completions, label, **kwargs)
+    return [row["reward_tag_cleanliness"] for row in batch]
+
+
 def reasoning_reward(completions: List[str], label: List[str], **kwargs: Any) -> List[float]:
     batch = build_reward_debug_batch(completions, label, **kwargs)
     return [row["reward_reasoning"] for row in batch]
+
+
+def advice_quality_reward(completions: List[str], label: List[str], **kwargs: Any) -> List[float]:
+    batch = build_reward_debug_batch(completions, label, **kwargs)
+    return [row["reward_advice_quality"] for row in batch]
 
 
 def length_reward(completions: List[str], label: List[str], **kwargs: Any) -> List[float]:
@@ -488,10 +561,14 @@ def length_reward(completions: List[str], label: List[str], **kwargs: Any) -> Li
 accuracy_reward.__name__ = "accuracy"
 format_reward.__name__ = "format"
 language_reward.__name__ = "language"
+tag_cleanliness_reward.__name__ = "tag_cleanliness"
 reasoning_reward.__name__ = "reasoning"
+advice_quality_reward.__name__ = "advice_quality"
 length_reward.__name__ = "length"
 
-REWARD_FUNCS = [accuracy_reward, format_reward, language_reward, reasoning_reward, length_reward]
+REWARD_FUNCS = [
+    accuracy_reward,
+]
 
 
 def smoke_reward_func(completions: List[str], label: List[str], **kwargs: Any) -> List[float]:

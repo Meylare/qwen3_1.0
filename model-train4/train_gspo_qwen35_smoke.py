@@ -563,6 +563,8 @@ def capture_new_completion_rows(
                 "advice_language",
                 "format_status",
                 "generic_advice_penalty_applied",
+                "tag_cleanliness_penalty_applied",
+                "short_advice_penalty_applied",
             ):
                 row[key] = debug.get(key)
         rows.append(row)

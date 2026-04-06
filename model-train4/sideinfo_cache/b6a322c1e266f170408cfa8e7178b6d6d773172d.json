@@ -1,0 +1,91 @@
+{
+  "video_path": "/home/ubuntu/model-train/model-train4/s3_cache/slon-bucket2/video_pairs/DVayRCEjL41.mp4",
+  "transcript": "[0.00-2.18] Шкаф, который думает за тебя.\n[2.40-3.88] Я поняла одну вещь.\n[4.18-5.68] Мы устаем не от дел.\n[6.08-7.76] Мы устаем от выбора.\n[7.88-10.94] Кто надеть, где лежит, куда положить.\n[11.18-13.46] Этот шкаф думает за себя.\n[14.22-22.10] Тут одежда, тут обувь, тут аксессуары и здесь сезонная.\n[22.44-27.76] Ты просто закрываешь и все логично, бесшумно и удобно.\n[27.76-33.30] Новый шкаф от Мебель Лайн, когда качество становится нормой.\n[33.30-38.20] Ширина 1,35 м, высота 2,90 м, под потолки 3 м.\n[38.46-39.54] Приходите к нам.\n[39.82-41.36] Мебель Лайн. Акжел 28.",
+  "transcript_segments": [
+    {
+      "start": 0.0,
+      "end": 2.18,
+      "text": " Шкаф, который думает за тебя."
+    },
+    {
+      "start": 2.4,
+      "end": 3.88,
+      "text": " Я поняла одну вещь."
+    },
+    {
+      "start": 4.18,
+      "end": 5.68,
+      "text": " Мы устаем не от дел."
+    },
+    {
+      "start": 6.08,
+      "end": 7.76,
+      "text": " Мы устаем от выбора."
+    },
+    {
+      "start": 7.88,
+      "end": 10.94,
+      "text": " Кто надеть, где лежит, куда положить."
+    },
+    {
+      "start": 11.18,
+      "end": 13.46,
+      "text": " Этот шкаф думает за себя."
+    },
+    {
+      "start": 14.22,
+      "end": 22.1,
+      "text": " Тут одежда, тут обувь, тут аксессуары и здесь сезонная."
+    },
+    {
+      "start": 22.44,
+      "end": 27.76,
+      "text": " Ты просто закрываешь и все логично, бесшумно и удобно."
+    },
+    {
+      "start": 27.76,
+      "end": 33.3,
+      "text": " Новый шкаф от Мебель Лайн, когда качество становится нормой."
+    },
+    {
+      "start": 33.3,
+      "end": 38.2,
+      "text": " Ширина 1,35 м, высота 2,90 м, под потолки 3 м."
+    },
+    {
+      "start": 38.46,
+      "end": 39.54,
+      "text": " Приходите к нам."
+    },
+    {
+      "start": 39.82,
+      "end": 41.36,
+      "text": " Мебель Лайн. Акжел 28."
+    }
+  ],
+  "lyrics_transcript": "",
+  "lyrics_transcript_segments": [],
+  "audio_summary": "Music not detected.",
+  "detected_language": "ru",
+  "lyrics_detected_language": null,
+  "speech_segmentation_mode": "inaspeech",
+  "segmentation_applied": true,
+  "segmentation_fallback": false,
+  "transcript_source": "speech_only",
+  "segmentation_total_audio_sec": 45.1643,
+  "segmentation_speech_sec": 42.5,
+  "segmentation_music_sec": 0.0,
+  "segmentation_noise_sec": 2.7643,
+  "segmentation_speech_ratio": 0.941,
+  "segmentation_num_speech_segments": 1,
+  "speech_only_audio_sec": 42.5,
+  "music_only_audio_sec": 0.0,
+  "segmentation_summary": "Segmentation mode inaspeech | speech=42.5s | music=0.0s | noise=2.8s | speech_ratio=0.94 | speech_segments=1",
+  "segmentation_sec": 9.7884,
+  "audio_extract_sec": 0.1367,
+  "transcription_sec": 1.967,
+  "lyrics_transcription_sec": 0.0,
+  "audio_summary_sec": 0.0,
+  "total_sec": 13.1405,
+  "cache_hit": false
+}
