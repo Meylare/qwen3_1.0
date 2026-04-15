@@ -72,11 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
-    parser.add_argument("--warmup_ratio", type=float, default=0.05)
-    parser.add_argument("--warmup_steps", type=int, default=20)
+    parser.add_argument("--learning_rate", type=float, default=2e-6)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--lr_scheduler_type", default="cosine")
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.99)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.03)
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--max_completion_length", type=int, default=4000)
@@ -240,6 +244,27 @@ def ensure_chat_template(processor: Any, model_path: str) -> str | None:
 
 
 def _patch_instrumentation(GRPOTrainerCls):
+    def _reset_rope_deltas_for(obj: Any) -> None:
+        visited: set[int] = set()
+        stack = [obj]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            ident = id(current)
+            if ident in visited:
+                continue
+            visited.add(ident)
+            if hasattr(current, "rope_deltas"):
+                try:
+                    current.rope_deltas = None
+                except Exception:
+                    pass
+            for attr in ("model", "base_model", "module", "language_model"):
+                child = getattr(current, attr, None)
+                if child is not None:
+                    stack.append(child)
+
     class InstrumentedGRPOTrainer(GRPOTrainerCls):
         def _reset_stage_profile(self) -> None:
             self._current_update_profile = {
@@ -276,6 +301,8 @@ def _patch_instrumentation(GRPOTrainerCls):
         def _generate_and_score_completions(self, *args, **kwargs):
             if not hasattr(self, "_completion_records"):
                 self._completion_records = []
+            _reset_rope_deltas_for(getattr(self, "model", None))
+            _reset_rope_deltas_for(getattr(self, "ref_model", None))
             self._last_reward_capture = None
             current_logs = getattr(self, "_logs", {}) or {}
             start_offsets = {
@@ -360,6 +387,8 @@ def _patch_instrumentation(GRPOTrainerCls):
         original_compute_loss = getattr(GRPOTrainerCls, "_compute_loss")
 
         def _compute_loss(self, *args, **kwargs):
+            _reset_rope_deltas_for(getattr(self, "model", None))
+            _reset_rope_deltas_for(getattr(self, "ref_model", None))
             start = time.perf_counter()
             out = original_compute_loss(self, *args, **kwargs)
             self._current_update_profile["compute_loss_sec"] = (
@@ -903,6 +932,11 @@ def summarize_training(
         "lr_scheduler_type": args.lr_scheduler_type,
         "warmup_steps": args.warmup_steps,
         "warmup_ratio": args.warmup_ratio,
+        "beta": args.beta,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
         "load_in_4bit": args.load_in_4bit,
         "train_duration_sec": round(train_duration_sec, 4),
         "avg_step_sec": round(avg_step_sec, 4) if avg_step_sec else None,
@@ -1021,7 +1055,10 @@ def main() -> None:
         warmup_ratio=0.0 if args.warmup_steps > 0 else args.warmup_ratio,
         warmup_steps=max(0, args.warmup_steps),
         lr_scheduler_type=args.lr_scheduler_type,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_strategy="steps",
@@ -1038,6 +1075,7 @@ def main() -> None:
         log_completions=True,
         seed=args.seed,
         importance_sampling_level="sequence",
+        beta=args.beta,
     )
 
     trainer = InstrumentedGRPOTrainer(

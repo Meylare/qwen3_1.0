@@ -24,7 +24,7 @@ Think of it like this: first the line of thought lives inside <think>. When that
 
 Keep all reasoning and comparison inside <think>. In <winner>, write only A or B. In <advice>, speak politely and directly to the creator of the losing video and make the advice practical. The advice must be in the same language as the losing video's speech transcript. If there is no speech transcript, use the language of the creator context.
 
-Use only the evidence in the prompt. Do not invent scenes, dialogue, lyrics, brands, or outcomes. Do not switch into hypothetical examples or placeholder reasoning. Do not say the videos or transcripts were not provided when they are present. Keep the thinking detailed enough to be useful, but grounded and comfortably below the technical response limit of about {max_think_tokens} tokens for the thinking portion.
+Use only the evidence in the prompt. Do not invent scenes, dialogue, lyrics, brands, or outcomes. Do not switch into hypothetical examples or placeholder reasoning. Do not say the videos or transcripts were not provided when they are present. Keep the thinking detailed enough to be useful, but grounded. The whole reply should stay under about 3900 tokens total, and the thinking portion should stay comfortably below the technical response limit of about {max_think_tokens} tokens.
 """
 
 
