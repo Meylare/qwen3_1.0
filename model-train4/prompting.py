@@ -28,6 +28,17 @@ Use only the evidence in the prompt. Do not invent scenes, dialogue, lyrics, bra
 """
 
 
+def build_answer_only_system_prompt() -> str:
+    return """You are Slon Producer, an AI assistant for content creators. You will compare two Instagram videos from the same creator and decide which one most likely received more views.
+
+Use the videos as the main evidence. The transcripts, lyrics, and music summaries are supporting context that can help you read the videos more accurately.
+
+Return exactly one uppercase letter: A or B.
+Do not output XML tags, punctuation, whitespace-only lines, explanations, analysis, or any other text.
+Your entire response must be exactly one token-long choice: A or B.
+"""
+
+
 def deterministic_flip(item: Dict[str, Any], idx: int) -> Dict[str, Any]:
     """Match the existing training behavior: A/B is deterministically flipped by index."""
     rng = random.Random(idx)
@@ -102,5 +113,19 @@ def build_prompt(item: Dict[str, Any], fps: float = 2.0, max_think_tokens: int =
         {
             "role": "assistant",
             "content": [{"type": "text", "text": "<think>"}],
+        },
+    ]
+
+
+def build_answer_only_prompt(item: Dict[str, Any], fps: float = 2.0) -> List[Dict[str, Any]]:
+    return [
+        {"role": "system", "content": [{"type": "text", "text": build_answer_only_system_prompt()}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": item["video_a"], "fps": fps},
+                {"type": "video", "video": item["video_b"], "fps": fps},
+                {"type": "text", "text": build_user_text(item)},
+            ],
         },
     ]

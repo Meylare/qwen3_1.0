@@ -12,6 +12,9 @@ from typing import Any, Dict
 
 import torch
 
+from pairwise_ab import get_choice_token_ids
+from prompting import build_answer_only_prompt
+
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "Qwen3.5-9B-Base"
 
@@ -22,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter_dir", type=Path, required=True)
     parser.add_argument("--dataset_jsonl", type=Path, required=True)
     parser.add_argument("--sample_index", type=int, default=0)
+    parser.add_argument("--fps", type=float, default=2.0)
+    parser.add_argument("--response_mode", choices=("xml_reasoned", "answer_only"), default="xml_reasoned")
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -96,13 +101,20 @@ def main() -> None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "left"
     chat_template = ensure_chat_template(processor, resolved_base_model)
+    choice_token_ids = get_choice_token_ids(processor.tokenizer) if args.response_mode == "answer_only" else None
 
     base_model = Qwen3_5ForConditionalGeneration.from_pretrained(resolved_base_model, **model_kwargs)
     model = PeftModel.from_pretrained(base_model, str(args.adapter_dir))
     model.eval()
 
+    prompt = sample.get("prompt")
+    if args.response_mode == "answer_only" and {"video_a", "video_b"} <= sample.keys():
+        prompt = build_answer_only_prompt(sample, fps=args.fps)
+    if prompt is None:
+        raise ValueError("Sample does not contain a usable prompt payload.")
+
     inputs = processor.apply_chat_template(
-        sample["prompt"],
+        prompt,
         chat_template=chat_template,
         tokenize=True,
         add_generation_prompt=True,
@@ -112,27 +124,46 @@ def main() -> None:
     inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
     start = time.perf_counter()
-    generated = model.generate(
-        **inputs,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.temperature > 0,
-        temperature=args.temperature,
-        pad_token_id=processor.tokenizer.pad_token_id,
-        eos_token_id=processor.tokenizer.eos_token_id,
-    )
+    if args.response_mode == "answer_only":
+        with torch.no_grad():
+            outputs = model(**inputs, logits_to_keep=1)
+        generated = None
+    else:
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.temperature > 0,
+            temperature=args.temperature,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id,
+        )
     elapsed = time.perf_counter() - start
 
-    prompt_len = inputs["input_ids"].shape[1]
-    trimmed = generated[:, prompt_len:]
-    answer = processor.batch_decode(trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+    prediction = None
+    choice_logit_a = None
+    choice_logit_b = None
+    if args.response_mode == "answer_only":
+        next_token_logits = outputs.logits[:, -1, :][0]
+        choice_logit_a = float(next_token_logits[choice_token_ids["A"]].item())
+        choice_logit_b = float(next_token_logits[choice_token_ids["B"]].item())
+        prediction = "A" if choice_logit_a >= choice_logit_b else "B"
+        answer = prediction
+    else:
+        prompt_len = inputs["input_ids"].shape[1]
+        trimmed = generated[:, prompt_len:]
+        answer = processor.batch_decode(trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
 
     payload = {
         "base_model": resolved_base_model,
         "adapter_dir": str(args.adapter_dir.resolve()),
         "dataset_jsonl": str(args.dataset_jsonl.resolve()),
         "sample_index": args.sample_index,
+        "response_mode": args.response_mode,
         "answer": answer,
+        "prediction": prediction,
         "latency_sec": round(elapsed, 4),
+        "choice_logit_a": round(choice_logit_a, 6) if choice_logit_a is not None else None,
+        "choice_logit_b": round(choice_logit_b, 6) if choice_logit_b is not None else None,
         "label": sample.get("label"),
         "video_a": sample.get("video_a"),
         "video_b": sample.get("video_b"),

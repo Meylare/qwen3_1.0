@@ -32,7 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from prepare_smoke_dataset import build_whisper_model, extract_video_side_info
-from prompting import build_prompt
+from pairwise_ab import get_choice_token_ids
+from prompting import build_answer_only_prompt, build_prompt
 
 
 DEFAULT_MODEL_DIR = HOME_ROOT / "models" / "Qwen3.5-9B-Base"
@@ -176,25 +177,6 @@ def add_output_limits(messages: List[Dict[str, Any]], max_think_tokens: int, max
     return append_system_instruction(messages, instruction)
 
 
-def force_answer_only(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    instruction = (
-        "Return exactly one uppercase letter: A or B.\n"
-        "Do not include <think>, explanations, XML tags, punctuation, whitespace-only lines, or any other text.\n"
-        "Your entire response must be exactly one character long: A or B."
-    )
-    enhanced = copy.deepcopy(messages)
-    if not enhanced:
-        return [{"role": "system", "content": [{"type": "text", "text": instruction}]}]
-
-    first = enhanced[0]
-    if first.get("role") == "system":
-        first["content"] = [{"type": "text", "text": instruction}]
-        return enhanced
-
-    enhanced.insert(0, {"role": "system", "content": [{"type": "text", "text": instruction}]})
-    return enhanced
-
-
 def parse_answer(text: str, response_mode: str) -> str | None:
     if response_mode == "answer_only":
         match = DIRECT_ANSWER_RE.match(text.strip())
@@ -206,16 +188,6 @@ def parse_answer(text: str, response_mode: str) -> str | None:
     if not match:
         return None
     return match.group(1).upper()
-
-
-def get_choice_token_ids(tokenizer: Any) -> Dict[str, int]:
-    choice_ids: Dict[str, int] = {}
-    for label in ("A", "B"):
-        token_ids = tokenizer.encode(label, add_special_tokens=False)
-        if len(token_ids) != 1:
-            raise ValueError(f"Expected {label!r} to map to exactly one token, got {token_ids}")
-        choice_ids[label] = int(token_ids[0])
-    return choice_ids
 
 
 def maybe_swap_pair(raw: Dict[str, Any], pair_index: int, balance_labels: bool, balance_seed: int) -> Tuple[Dict[str, Any], bool]:
@@ -615,10 +587,10 @@ def main() -> None:
             "audio_summary_a": side_a.get("audio_summary", ""),
             "audio_summary_b": side_b.get("audio_summary", ""),
         }
-        prompt = build_prompt(prompt_item, fps=args.fps)
         if args.response_mode == "answer_only":
-            prompt = force_answer_only(prompt)
+            prompt = build_answer_only_prompt(prompt_item, fps=args.fps)
         else:
+            prompt = build_prompt(prompt_item, fps=args.fps, max_think_tokens=args.max_think_tokens)
             prompt = add_output_limits(prompt, args.max_think_tokens, args.max_answer_tokens)
 
         try:
