@@ -965,7 +965,6 @@ def main() -> None:
     resolved_model_name = resolve_model_path(args.model_name)
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
 
     monitor.set_phase("imports")
     stage_start = time.perf_counter()

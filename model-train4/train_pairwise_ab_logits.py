@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import math
 import json
 import os
@@ -59,6 +60,8 @@ class PairwisePromptDataset:
 
 
 class PairwiseABCollator:
+    _SMALL_TENSOR_CACHE_KEYS = frozenset({"input_ids", "attention_mask", "labels"})
+
     def __init__(
         self,
         processor: Any,
@@ -102,8 +105,14 @@ class PairwiseABCollator:
             cached = self._encode_single_feature(feature)
             if sample_id != "__uncached__":
                 self._cached_samples[sample_id] = cached
+        # Re-clone only the cheap text/label tensors. Large cached video features are read-only here:
+        # we only concatenate them into the batch and never mutate them in-place.
         return {
-            key: (value.clone() if torch.is_tensor(value) else value)
+            key: (
+                value.clone()
+                if torch.is_tensor(value) and key in self._SMALL_TENSOR_CACHE_KEYS
+                else value
+            )
             for key, value in cached.items()
         }
 
@@ -168,7 +177,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument("--dataloader_num_workers", type=int, default=2)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=2)
     parser.add_argument("--training_backend", choices=["manual", "trainer"], default="manual")
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
@@ -227,12 +237,229 @@ def compute_last_nonpad_indices(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.shape[1] - 1 - distance_from_end
 
 
+def resolve_choice_backbone(model: Any) -> Any:
+    root_model = getattr(model, "module", model)
+    base_model = root_model
+    get_base_model = getattr(root_model, "get_base_model", None)
+    if callable(get_base_model):
+        candidate = get_base_model()
+        if candidate is not None:
+            base_model = candidate
+
+    for candidate in (
+        getattr(base_model, "model", None),
+        getattr(root_model, "model", None),
+        base_model,
+        root_model,
+    ):
+        if candidate is not None:
+            return candidate
+    raise AttributeError("Could not resolve the transformer backbone for choice-logit projection.")
+
+
+def resolve_choice_lm_head(model: Any) -> Any:
+    for candidate in (getattr(model, "module", None), model):
+        if candidate is None:
+            continue
+        get_output_embeddings = getattr(candidate, "get_output_embeddings", None)
+        if callable(get_output_embeddings):
+            lm_head = get_output_embeddings()
+            if lm_head is not None:
+                return lm_head
+        lm_head = getattr(candidate, "lm_head", None)
+        if lm_head is not None:
+            return lm_head
+    raise AttributeError("Could not resolve lm_head for choice-logit projection.")
+
+
+def resolve_choice_language_model(backbone: Any) -> Any:
+    language_model = getattr(backbone, "language_model", None)
+    if language_model is None:
+        raise AttributeError("Could not resolve language_model for choice-logit projection.")
+    return language_model
+
+
+def extract_last_token_hidden(
+    last_hidden_state: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if last_hidden_state.ndim != 3:
+        raise ValueError(
+            f"Expected hidden states shaped [batch, seq, hidden], got {last_hidden_state.shape}"
+        )
+    if last_hidden_state.shape[1] == 1:
+        return last_hidden_state[:, 0, :]
+    if attention_mask is None:
+        return last_hidden_state[:, -1, :]
+    last_indices = compute_last_nonpad_indices(attention_mask)
+    batch_indices = torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device)
+    return last_hidden_state[batch_indices, last_indices, :]
+
+
+def project_choice_logits(
+    last_hidden: torch.Tensor,
+    lm_head: Any,
+    choice_token_ids: Dict[str, int],
+) -> torch.Tensor:
+    choice_ids = torch.tensor(
+        [choice_token_ids["A"], choice_token_ids["B"]],
+        device=lm_head.weight.device,
+        dtype=torch.long,
+    )
+    choice_weight = lm_head.weight.index_select(0, choice_ids)
+    choice_bias = None
+    if getattr(lm_head, "bias", None) is not None:
+        choice_bias = lm_head.bias.index_select(0, choice_ids)
+    return F.linear(last_hidden.to(dtype=choice_weight.dtype), choice_weight, choice_bias)
+
+
+def filter_supported_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return kwargs
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+
+
+def build_choice_multimodal_state(backbone: Any, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    input_ids = model_inputs.get("input_ids")
+    if input_ids is None:
+        raise ValueError("Expected input_ids when building multimodal inputs_embeds.")
+
+    inputs_embeds = backbone.get_input_embeddings()(input_ids)
+    image_mask = None
+    video_mask = None
+    deepstack_image_embeds = None
+    deepstack_video_embeds = None
+
+    pixel_values = model_inputs.get("pixel_values")
+    image_grid_thw = model_inputs.get("image_grid_thw")
+    if pixel_values is not None:
+        with torch.no_grad():
+            image_outputs = backbone.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                return_dict=True,
+            )
+            image_embeds = image_outputs.pooler_output
+            deepstack_image_embeds = getattr(image_outputs, "deepstack_features", None)
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask, _ = backbone.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=image_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    pixel_values_videos = model_inputs.get("pixel_values_videos")
+    video_grid_thw = model_inputs.get("video_grid_thw")
+    if pixel_values_videos is not None:
+        with torch.no_grad():
+            video_outputs = backbone.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                return_dict=True,
+            )
+            video_embeds = video_outputs.pooler_output
+            deepstack_video_embeds = getattr(video_outputs, "deepstack_features", None)
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        _, video_mask = backbone.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            video_features=video_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+    visual_pos_masks = None
+    deepstack_visual_embeds = None
+    if image_mask is not None and video_mask is not None and deepstack_image_embeds is not None and deepstack_video_embeds is not None:
+        image_mask = image_mask[..., 0]
+        video_mask = video_mask[..., 0]
+        visual_pos_masks = image_mask | video_mask
+        deepstack_visual_embeds = []
+        image_mask_joint = image_mask[visual_pos_masks]
+        video_mask_joint = video_mask[visual_pos_masks]
+        visual_token_count = int(visual_pos_masks.sum().item())
+        for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+            embed_joint = img_embed.new_zeros((visual_token_count, img_embed.shape[-1]), device=img_embed.device)
+            embed_joint[image_mask_joint, :] = img_embed
+            embed_joint[video_mask_joint, :] = vid_embed
+            deepstack_visual_embeds.append(embed_joint)
+    elif image_mask is not None and deepstack_image_embeds is not None:
+        visual_pos_masks = image_mask[..., 0]
+        deepstack_visual_embeds = deepstack_image_embeds
+    elif video_mask is not None and deepstack_video_embeds is not None:
+        visual_pos_masks = video_mask[..., 0]
+        deepstack_visual_embeds = deepstack_video_embeds
+
+    return {
+        "inputs_embeds": inputs_embeds,
+        "visual_pos_masks": visual_pos_masks,
+        "deepstack_visual_embeds": deepstack_visual_embeds,
+    }
+
+
+def extract_choice_backbone_outputs(
+    backbone: Any,
+    model_inputs: Dict[str, Any],
+) -> Any:
+    # The visual tower is frozen in stage-1 training, so we materialize visual embeddings once
+    # under no_grad and then run backward only through the language branch.
+    if all(
+        hasattr(backbone, attr)
+        for attr in ("language_model", "get_input_embeddings", "get_placeholder_mask")
+    ):
+        language_model = resolve_choice_language_model(backbone)
+        multimodal_state = build_choice_multimodal_state(backbone, model_inputs)
+        position_ids = backbone.compute_3d_position_ids(
+            **filter_supported_kwargs(
+                backbone.compute_3d_position_ids,
+                {
+                    "input_ids": model_inputs.get("input_ids"),
+                    "image_grid_thw": model_inputs.get("image_grid_thw"),
+                    "video_grid_thw": model_inputs.get("video_grid_thw"),
+                    "inputs_embeds": multimodal_state["inputs_embeds"],
+                    "attention_mask": model_inputs.get("attention_mask"),
+                    "past_key_values": model_inputs.get("past_key_values"),
+                    "second_per_grid_ts": model_inputs.get("second_per_grid_ts"),
+                },
+            )
+        )
+        return language_model(
+            **filter_supported_kwargs(
+                language_model,
+                {
+                    "input_ids": None,
+                    "position_ids": position_ids,
+                    "attention_mask": model_inputs.get("attention_mask"),
+                    "past_key_values": model_inputs.get("past_key_values"),
+                    "inputs_embeds": multimodal_state["inputs_embeds"],
+                    "use_cache": model_inputs.get("use_cache"),
+                    "output_attentions": model_inputs.get("output_attentions"),
+                    "output_hidden_states": model_inputs.get("output_hidden_states"),
+                    "return_dict": True,
+                    "cache_position": model_inputs.get("cache_position"),
+                    "visual_pos_masks": multimodal_state["visual_pos_masks"],
+                    "deepstack_visual_embeds": multimodal_state["deepstack_visual_embeds"],
+                },
+            )
+        )
+    return backbone(**model_inputs)
+
+
 def build_pairwise_trainer_cls(trainer_cls):
     class PairwiseABTrainer(trainer_cls):
         def __init__(self, *args, choice_token_ids: Dict[str, int], **kwargs):
             super().__init__(*args, **kwargs)
             self.choice_token_ids = choice_token_ids
-            self._supports_logits_to_keep: bool | None = None
+            self._choice_backbone: Any | None = None
+            self._choice_lm_head: Any | None = None
             # Unsloth patches Trainer.get_batch_samples assuming token-level labels.
             # Our stage-1 objective uses scalar class labels (A/B), so we opt out.
             self.model_accepts_loss_kwargs = False
@@ -247,41 +474,21 @@ def build_pairwise_trainer_cls(trainer_cls):
                     break
             return batch_samples, None
 
-        def _forward_model(self, model: Any, model_inputs: Dict[str, Any]) -> Any:
-            if self._supports_logits_to_keep is False:
-                return model(**model_inputs)
-            try:
-                outputs = model(**model_inputs, logits_to_keep=1)
-                self._supports_logits_to_keep = True
-                return outputs
-            except TypeError as exc:
-                if "logits_to_keep" not in str(exc):
-                    raise
-                self._supports_logits_to_keep = False
-                return model(**model_inputs)
+        def _get_choice_projection_modules(self, model: Any) -> tuple[Any, Any]:
+            if self._choice_backbone is None:
+                self._choice_backbone = resolve_choice_backbone(model)
+            if self._choice_lm_head is None:
+                self._choice_lm_head = resolve_choice_lm_head(model)
+            return self._choice_backbone, self._choice_lm_head
 
         def _extract_choice_logits(self, model: Any, model_inputs: Dict[str, Any]) -> torch.Tensor:
-            outputs = self._forward_model(model, model_inputs)
-            logits = outputs.logits
-            if logits.ndim != 3:
-                raise ValueError(f"Expected logits shaped [batch, seq, vocab], got {logits.shape}")
-            if logits.shape[1] == 1:
-                next_token_logits = logits[:, 0, :]
-            else:
-                attention_mask = model_inputs.get("attention_mask")
-                if attention_mask is None:
-                    next_token_logits = logits[:, -1, :]
-                else:
-                    last_indices = compute_last_nonpad_indices(attention_mask)
-                    batch_indices = torch.arange(logits.shape[0], device=logits.device)
-                    next_token_logits = logits[batch_indices, last_indices, :]
-            return torch.stack(
-                (
-                    next_token_logits[:, self.choice_token_ids["A"]],
-                    next_token_logits[:, self.choice_token_ids["B"]],
-                ),
-                dim=-1,
+            backbone, lm_head = self._get_choice_projection_modules(model)
+            outputs = extract_choice_backbone_outputs(backbone, model_inputs)
+            last_hidden = extract_last_token_hidden(
+                outputs.last_hidden_state,
+                model_inputs.get("attention_mask"),
             )
+            return project_choice_logits(last_hidden, lm_head, self.choice_token_ids)
 
         def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, **_: Any):
             labels = inputs["labels"]
@@ -347,6 +554,7 @@ def build_runtime_summary(
         "disable_unsloth_compile": bool(args.disable_unsloth_compile),
         "cache_processed_samples": bool(args.cache_processed_samples),
         "dataloader_num_workers": int(args.dataloader_num_workers),
+        "dataloader_prefetch_factor": int(args.dataloader_prefetch_factor),
         "telegram_progress_every": int(args.telegram_progress_every),
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -412,6 +620,23 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
     }
 
 
+def maybe_cuda_synchronize() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def build_dataloader_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    num_workers = max(0, int(args.dataloader_num_workers))
+    kwargs: Dict[str, Any] = {
+        "pin_memory": torch.cuda.is_available(),
+        "num_workers": num_workers,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = max(1, int(args.dataloader_prefetch_factor))
+    return kwargs
+
+
 def build_autocast_context() -> Any:
     if torch.cuda.is_available():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -422,41 +647,18 @@ def forward_choice_logits(
     model: Any,
     model_inputs: Dict[str, Any],
     choice_token_ids: Dict[str, int],
-    supports_logits_to_keep: bool | None,
-) -> tuple[torch.Tensor, bool]:
-    if supports_logits_to_keep is False:
-        outputs = model(**model_inputs)
-    else:
-        try:
-            outputs = model(**model_inputs, logits_to_keep=1)
-            supports_logits_to_keep = True
-        except TypeError as exc:
-            if "logits_to_keep" not in str(exc):
-                raise
-            outputs = model(**model_inputs)
-            supports_logits_to_keep = False
-
-    logits = outputs.logits
-    if logits.ndim != 3:
-        raise ValueError(f"Expected logits shaped [batch, seq, vocab], got {logits.shape}")
-    if logits.shape[1] == 1:
-        next_token_logits = logits[:, 0, :]
-    else:
-        attention_mask = model_inputs.get("attention_mask")
-        if attention_mask is None:
-            next_token_logits = logits[:, -1, :]
-        else:
-            last_indices = compute_last_nonpad_indices(attention_mask)
-            batch_indices = torch.arange(logits.shape[0], device=logits.device)
-            next_token_logits = logits[batch_indices, last_indices, :]
-    choice_logits = torch.stack(
-        (
-            next_token_logits[:, choice_token_ids["A"]],
-            next_token_logits[:, choice_token_ids["B"]],
-        ),
-        dim=-1,
+    choice_backbone: Any | None = None,
+    choice_lm_head: Any | None = None,
+) -> torch.Tensor:
+    # Run only the backbone and project the final token onto A/B to avoid [batch, seq, vocab] logits.
+    backbone = choice_backbone if choice_backbone is not None else resolve_choice_backbone(model)
+    outputs = extract_choice_backbone_outputs(backbone, model_inputs)
+    last_hidden = extract_last_token_hidden(
+        outputs.last_hidden_state,
+        model_inputs.get("attention_mask"),
     )
-    return choice_logits, bool(supports_logits_to_keep)
+    lm_head = choice_lm_head if choice_lm_head is not None else resolve_choice_lm_head(model)
+    return project_choice_logits(last_hidden, lm_head, choice_token_ids)
 
 
 def compute_total_training_steps(args: argparse.Namespace, train_loader_len: int) -> int:
@@ -510,35 +712,36 @@ def run_manual_evaluation(
     collator: PairwiseABCollator,
     args: argparse.Namespace,
     choice_token_ids: Dict[str, int],
-    supports_logits_to_keep: bool | None,
-) -> tuple[Dict[str, Any], bool | None]:
+) -> Dict[str, Any]:
     if eval_dataset is None or len(eval_dataset) == 0:
-        return {}, supports_logits_to_keep
+        return {}
 
+    dataloader_kwargs = build_dataloader_kwargs(args)
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=args.per_device_eval_batch_size,
         shuffle=False,
         collate_fn=collator,
-        pin_memory=torch.cuda.is_available(),
-        num_workers=args.dataloader_num_workers,
-        persistent_workers=args.dataloader_num_workers > 0,
+        **dataloader_kwargs,
     )
     model.eval()
     losses: list[float] = []
     logits_rows: list[torch.Tensor] = []
     label_rows: list[torch.Tensor] = []
+    choice_backbone = resolve_choice_backbone(model)
+    choice_lm_head = resolve_choice_lm_head(model)
 
     with torch.no_grad():
         for batch in eval_loader:
             batch = move_batch_to_device(batch, model.device)
             labels = batch.pop("labels")
             with build_autocast_context():
-                choice_logits, supports_logits_to_keep = forward_choice_logits(
+                choice_logits = forward_choice_logits(
                     model=model,
                     model_inputs=batch,
                     choice_token_ids=choice_token_ids,
-                    supports_logits_to_keep=supports_logits_to_keep,
+                    choice_backbone=choice_backbone,
+                    choice_lm_head=choice_lm_head,
                 )
                 loss = F.cross_entropy(choice_logits.float(), labels)
             losses.append(float(loss.detach().item()))
@@ -551,7 +754,7 @@ def run_manual_evaluation(
     metrics = compute_choice_metrics(logits_np, labels_np)
     if losses:
         metrics["eval_loss"] = round(sum(losses) / len(losses), 6)
-    return metrics, supports_logits_to_keep
+    return metrics
 
 
 def main() -> None:
@@ -565,7 +768,6 @@ def main() -> None:
     resolved_model_name = resolve_model_path(args.model_name)
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -672,14 +874,13 @@ def main() -> None:
         if args.resume_from_checkpoint:
             raise ValueError("resume_from_checkpoint is not supported with training_backend=manual.")
 
+        dataloader_kwargs = build_dataloader_kwargs(args)
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.per_device_train_batch_size,
             shuffle=True,
             collate_fn=collator,
-            pin_memory=torch.cuda.is_available(),
-            num_workers=args.dataloader_num_workers,
-            persistent_workers=args.dataloader_num_workers > 0,
+            **dataloader_kwargs,
         )
         total_training_steps = compute_total_training_steps(args, len(train_loader))
         trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -699,7 +900,8 @@ def main() -> None:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-        supports_logits_to_keep: bool | None = None
+        choice_backbone = resolve_choice_backbone(model)
+        choice_lm_head = resolve_choice_lm_head(model)
         global_step = 0
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
@@ -756,24 +958,31 @@ def main() -> None:
                 if hasattr(pixel_values_videos, "shape") and len(pixel_values_videos.shape) > 0:
                     update_profile["video_rows"] += int(pixel_values_videos.shape[0])
 
+                maybe_cuda_synchronize()
                 move_start = time.perf_counter()
                 batch = move_batch_to_device(batch, model.device)
+                maybe_cuda_synchronize()
                 update_profile["move_batch_to_device_sec"] += time.perf_counter() - move_start
                 labels = batch.pop("labels")
+                maybe_cuda_synchronize()
                 forward_start = time.perf_counter()
                 with build_autocast_context():
-                    choice_logits, supports_logits_to_keep = forward_choice_logits(
+                    choice_logits = forward_choice_logits(
                         model=model,
                         model_inputs=batch,
                         choice_token_ids=choice_token_ids,
-                        supports_logits_to_keep=supports_logits_to_keep,
+                        choice_backbone=choice_backbone,
+                        choice_lm_head=choice_lm_head,
                     )
                     loss = F.cross_entropy(choice_logits.float(), labels)
                     scaled_loss = loss / max(1, args.gradient_accumulation_steps)
+                maybe_cuda_synchronize()
                 update_profile["forward_loss_sec"] += time.perf_counter() - forward_start
 
+                maybe_cuda_synchronize()
                 backward_start = time.perf_counter()
                 scaled_loss.backward()
+                maybe_cuda_synchronize()
                 update_profile["backward_sec"] += time.perf_counter() - backward_start
                 accumulated_loss += float(loss.detach().item())
                 is_update_step = batch_index % max(1, args.gradient_accumulation_steps) == 0
@@ -781,10 +990,12 @@ def main() -> None:
                 if not (is_update_step or is_last_batch):
                     continue
 
+                maybe_cuda_synchronize()
                 optimizer_start = time.perf_counter()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                maybe_cuda_synchronize()
                 update_profile["optimizer_step_sec"] += time.perf_counter() - optimizer_start
 
                 global_step += 1
@@ -809,6 +1020,8 @@ def main() -> None:
                         "step": global_step,
                         "loss": round(mean_update_loss, 6),
                         "lr": round(float(scheduler.get_last_lr()[0]), 10),
+                        "input_ids_tokens": profile_row["input_ids_tokens"],
+                        "video_rows": profile_row["video_rows"],
                         "batch_fetch_sec": profile_row["batch_fetch_sec"],
                         "forward_loss_sec": profile_row["forward_loss_sec"],
                         "backward_sec": profile_row["backward_sec"],
@@ -861,13 +1074,12 @@ def main() -> None:
                 "training_backend": args.training_backend,
             },
         )
-        eval_metrics, _ = run_manual_evaluation(
+        eval_metrics = run_manual_evaluation(
             model=model,
             eval_dataset=eval_dataset,
             collator=collator,
             args=args,
             choice_token_ids=choice_token_ids,
-            supports_logits_to_keep=supports_logits_to_keep,
         )
         if eval_metrics:
             save_metrics_file(args.output_dir / "eval_results.json", eval_metrics)
@@ -909,7 +1121,14 @@ def main() -> None:
             optim="adamw_8bit",
             remove_unused_columns=False,
             label_names=["labels"],
-            dataloader_pin_memory=False,
+            dataloader_num_workers=max(0, int(args.dataloader_num_workers)),
+            dataloader_prefetch_factor=(
+                max(1, int(args.dataloader_prefetch_factor))
+                if args.dataloader_num_workers > 0
+                else None
+            ),
+            dataloader_persistent_workers=args.dataloader_num_workers > 0,
+            dataloader_pin_memory=torch.cuda.is_available(),
             seed=args.seed,
             resume_from_checkpoint=args.resume_from_checkpoint,
         )
